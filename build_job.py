@@ -7,6 +7,7 @@ Auto-applies low-risk staged changes. Flags medium/high for morning review.
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 from datetime import datetime
@@ -38,8 +39,8 @@ def apply_action(action: dict, staged_file: Path) -> bool:
 
     try:
         if action_type == "model_pull" and content.startswith("ollama pull"):
-            model_name = content.split()[-1]
-            result = subprocess.run(content.split(), capture_output=True, text=True, timeout=300)
+            model_name = shlex.split(content)[-1]
+            result = subprocess.run(shlex.split(content), capture_output=True, text=True, timeout=300)
             if result.returncode != 0:
                 log(f"  Model pull failed: {result.stderr}")
                 return False
@@ -84,8 +85,13 @@ def apply_action(action: dict, staged_file: Path) -> bool:
             f.write(f"# Applied: {datetime.now().isoformat()}\n\n")
             if rollback_cmd:
                 f.write(rollback_cmd + "\n")
-            elif file_path and Path(str(file_path) + ".bak").exists():
-                f.write(f'mv "{file_path}.bak" "{file_path}"\n')
+            elif file_path:
+                expanded = Path(file_path).expanduser()
+                bak = Path(str(expanded) + ".bak")
+                if bak.exists():
+                    f.write(f'mv "{bak}" "{expanded}"\n')
+                else:
+                    f.write(f"echo 'Manual rollback required for: {title}'\n")
             else:
                 f.write(f"echo 'Manual rollback required for: {title}'\n")
         os.chmod(rollback_path, 0o755)

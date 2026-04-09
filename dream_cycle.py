@@ -39,6 +39,18 @@ def log(msg: str):
     ts = datetime.now().strftime("%H:%M:%S")
     print(f"[{ts}] {msg}", flush=True)
 
+def extract_json(text: str) -> dict:
+    """Extract the first valid JSON object from an LLM response."""
+    decoder = json.JSONDecoder()
+    for i, ch in enumerate(text):
+        if ch == '{':
+            try:
+                obj, _ = decoder.raw_decode(text, i)
+                return obj
+            except json.JSONDecodeError:
+                continue
+    raise ValueError("No JSON object found in response")
+
 def ollama_chat(prompt: str, system: str = "") -> str:
     payload = {
         "model": LOCAL_MODEL,
@@ -175,8 +187,7 @@ Tasks:
 
     result = ollama_chat(prompt)
     try:
-        clean = result[result.index("{"):result.rindex("}") + 1]
-        return json.loads(clean)
+        return extract_json(result)
     except Exception:
         log("Scan parse failed, using raw structure")
         return {"priority_track": "AI/ML", "priority_reason": "parse error", "top_findings": []}
@@ -208,8 +219,7 @@ Return JSON only:
 
     result = ollama_chat(prompt)
     try:
-        clean = result[result.index("{"):result.rindex("}") + 1]
-        return json.loads(clean)
+        return extract_json(result)
     except Exception:
         return {"observations": ["Reflection parse failed"], "improvement_areas": []}
 
@@ -219,6 +229,9 @@ def phase_deep_research(scan_results: dict) -> dict:
     log("Phase 3: Deep research via Claude...")
 
     findings = scan_results.get("top_findings", [])
+    if not findings:
+        log("No findings from Phase 1, skipping Phase 3")
+        return {"research": [], "cross_connections": ""}
     priority = scan_results.get("priority_track", "AI/ML")
 
     prompt = f"""You are the deep research phase of a nightly agent.
@@ -253,8 +266,7 @@ Return JSON:
 
     result = claude_chat(prompt)
     try:
-        clean = result[result.index("{"):result.rindex("}") + 1]
-        return json.loads(clean)
+        return extract_json(result)
     except Exception:
         log("Deep research parse failed")
         return {"research": [], "cross_connections": ""}
@@ -296,8 +308,7 @@ Return JSON:
 
     result = claude_chat(prompt)
     try:
-        clean = result[result.index("{"):result.rindex("}") + 1]
-        return json.loads(clean)
+        return extract_json(result)
     except Exception:
         log("Judge parse failed")
         return {"staged_actions": [], "summary": "Parse failed", "tonight_score": 0}
