@@ -14,6 +14,7 @@ from pathlib import Path
 
 import anthropic
 import requests
+import xml.etree.ElementTree as ET
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 BASE_DIR = Path.home() / "dream-cycle"
@@ -31,6 +32,19 @@ LOCAL_MODEL = ""                    # set at runtime from config or interactive 
 CLAUDE_MODEL = "claude-sonnet-4-6"  # Anthropic — deep research + judge
 
 TRACKS = ["AI/ML", "Cybersecurity", "Robotics/CV", "Data Analytics", "Project Management"]
+
+DEFAULT_RSS_FEEDS = [
+    {"name": "Hacker News",        "url": "https://news.ycombinator.com/rss",                                  "track": "AI/ML"},
+    {"name": "HuggingFace Blog",   "url": "https://huggingface.co/blog/feed.xml",                              "track": "AI/ML"},
+    {"name": "Anthropic Blog",     "url": "https://www.anthropic.com/rss.xml",                                 "track": "AI/ML"},
+    {"name": "MIT AI News",        "url": "https://news.mit.edu/topic/artificial-intelligence2/feed",          "track": "AI/ML"},
+    {"name": "Krebs on Security",  "url": "https://krebsonsecurity.com/feed/",                                 "track": "Cybersecurity"},
+    {"name": "The Hacker News",    "url": "https://feeds.feedburner.com/TheHackersNews",                       "track": "Cybersecurity"},
+    {"name": "Dark Reading",       "url": "https://www.darkreading.com/rss.xml",                               "track": "Cybersecurity"},
+    {"name": "IEEE Spectrum AI",   "url": "https://spectrum.ieee.org/feeds/topic/artificial-intelligence.rss", "track": "AI/ML"},
+    {"name": "IEEE Robotics",      "url": "https://spectrum.ieee.org/feeds/topic/robotics.rss",                "track": "Robotics/CV"},
+    {"name": "Towards Data Sci.",  "url": "https://towardsdatascience.com/feed",                               "track": "Data Analytics"},
+]
 
 client = anthropic.Anthropic()
 
@@ -98,6 +112,102 @@ def select_local_model() -> str:
         return model_name
     return "qwen2.5:7b"
 
+# ── RSS feeds ─────────────────────────────────────────────────────────────────
+
+def fetch_rss_feed(feed: dict, max_items: int = 5) -> list[dict]:
+    """Fetch and parse a single RSS 2.0 or Atom feed."""
+    url, name = feed["url"], feed["name"]
+    try:
+        r = requests.get(url, timeout=30, headers={"User-Agent": "DreamCycle/1.0"})
+        r.raise_for_status()
+        root = ET.fromstring(r.content)
+
+        # Detect format: Atom feeds have a namespace containing 'atom' or use <feed> root
+        raw_tag = root.tag
+        ns_uri = raw_tag[1:raw_tag.index("}")] if raw_tag.startswith("{") else ""
+        is_atom = "atom" in ns_uri or root.tag.endswith("feed")
+        p = f"{{{ns_uri}}}" if ns_uri else ""
+
+        items = []
+        if is_atom:
+            for entry in root.findall(f"{p}entry")[:max_items]:
+                title_el  = entry.find(f"{p}title")
+                link_el   = entry.find(f"{p}link")
+                summ_el   = entry.find(f"{p}summary") or entry.find(f"{p}content")
+                items.append({
+                    "title":   (title_el.text or "").strip(),
+                    "link":    link_el.get("href", "") if link_el is not None else "",
+                    "summary": (summ_el.text or "")[:400].strip() if summ_el is not None else "",
+                    "source":  name,
+                    "track":   feed.get("track", "AI/ML"),
+                })
+        else:
+            channel = root.find("channel")
+            if channel is None:
+                return []
+            for item in channel.findall("item")[:max_items]:
+                title_el = item.find("title")
+                link_el  = item.find("link")
+                desc_el  = item.find("description")
+                items.append({
+                    "title":   (title_el.text or "").strip() if title_el is not None else "",
+                    "link":    (link_el.text or "").strip()  if link_el  is not None else "",
+                    "summary": (desc_el.text  or "")[:400].strip() if desc_el is not None else "",
+                    "source":  name,
+                    "track":   feed.get("track", "AI/ML"),
+                })
+        return items
+    except Exception as e:
+        log(f"RSS fetch error ({name}): {e}")
+        return []
+
+def fetch_all_rss_feeds(feeds: list[dict]) -> list[dict]:
+    results = []
+    for feed in feeds:
+        items = fetch_rss_feed(feed)
+        results.extend(items)
+        if items:
+            log(f"  RSS [{feed['name']}]: {len(items)} items")
+    return results
+
+def configure_rss_feeds() -> list[dict]:
+    """Interactively select RSS feeds to subscribe to."""
+    print("\n── RSS Feed Selection ─────────────────────────────────────────")
+    print("Select feeds to follow (comma-separated numbers, 'all', or 'none'):\n")
+    for i, f in enumerate(DEFAULT_RSS_FEEDS, 1):
+        print(f"  {i:2}. [{f['track']:15}] {f['name']}")
+    print()
+
+    while True:
+        raw = input("Selection [all]: ").strip().lower() or "all"
+        if raw == "all":
+            selected = list(DEFAULT_RSS_FEEDS)
+            break
+        if raw == "none":
+            selected = []
+            break
+        try:
+            indices = [int(x.strip()) - 1 for x in raw.split(",")]
+            if all(0 <= i < len(DEFAULT_RSS_FEEDS) for i in indices):
+                selected = [DEFAULT_RSS_FEEDS[i] for i in indices]
+                break
+            print(f"  Numbers must be between 1 and {len(DEFAULT_RSS_FEEDS)}")
+        except ValueError:
+            print("  Enter numbers separated by commas, 'all', or 'none'")
+
+    # Allow custom feed URLs
+    print(f"\n{len(selected)} feed(s) selected.")
+    while True:
+        custom = input("Add a custom feed URL? (paste URL or press Enter to skip): ").strip()
+        if not custom:
+            break
+        custom_name = input("  Name for this feed: ").strip() or custom
+        custom_track = input(f"  Track ({'/'.join(TRACKS)}): ").strip() or "AI/ML"
+        selected.append({"name": custom_name, "url": custom, "track": custom_track})
+        print(f"  Added: {custom_name}")
+
+    return selected
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def log(msg: str):
@@ -148,7 +258,6 @@ def claude_chat(prompt: str, system: str = "") -> str:
         return ""
 
 def fetch_arxiv(query: str, max_results: int = 10) -> list[dict]:
-    import xml.etree.ElementTree as ET
     url = "http://export.arxiv.org/api/query"
     params = {"search_query": query, "max_results": max_results, "sortBy": "submittedDate"}
     try:
@@ -214,7 +323,7 @@ def load_perf_log() -> list[dict]:
 
 # ── Phase 1: Scan ──────────────────────────────────────────────────────────────
 
-def phase_scan() -> dict:
+def phase_scan(rss_feeds: list[dict] = None) -> dict:
     log("Phase 1: Scanning sources...")
 
     arxiv_ai = fetch_arxiv("machine learning agents LLM", 8)
@@ -222,6 +331,7 @@ def phase_scan() -> dict:
     arxiv_sec = fetch_arxiv("cybersecurity vulnerability detection", 5)
     github = fetch_github_trending()
     cves = fetch_cve_recent()
+    rss_items = fetch_all_rss_feeds(rss_feeds) if rss_feeds else []
 
     raw = {
         "arxiv_ai": arxiv_ai,
@@ -229,13 +339,14 @@ def phase_scan() -> dict:
         "arxiv_sec": arxiv_sec,
         "github_trending": github,
         "recent_cves": cves,
+        "rss_feeds": rss_items,
     }
 
     prompt = f"""You are the scan phase of a nightly research agent for a technical consultant
 working across: {', '.join(TRACKS)}.
 
-Here is tonight's raw data:
-{json.dumps(raw, indent=2)[:6000]}
+Here is tonight's raw data (includes arXiv papers, GitHub trending, CVEs, and RSS feed items):
+{json.dumps(raw, indent=2)[:8000]}
 
 Tasks:
 1. Score each item 1-10 for relevance across all tracks
@@ -485,15 +596,19 @@ def main():
     date_str = datetime.now().strftime("%Y-%m-%d")
     log(f"=== Dream Cycle Starting — {date_str} ===")
 
-    # Load persisted model, or prompt once and save it
+    # Load persisted settings, or prompt once and save
     config = load_config()
     if not config.get("local_model"):
         config["local_model"] = select_local_model()
         save_config(config)
+    if "rss_feeds" not in config:
+        config["rss_feeds"] = configure_rss_feeds()
+        save_config(config)
     LOCAL_MODEL = config["local_model"]
-    log(f"Local model: {LOCAL_MODEL}")
+    rss_feeds = config.get("rss_feeds", [])
+    log(f"Local model: {LOCAL_MODEL} | RSS feeds: {len(rss_feeds)}")
 
-    scan = phase_scan()
+    scan = phase_scan(rss_feeds)
     reflect = phase_reflect()
     research = phase_deep_research(scan)
     judge = phase_judge_and_stage(scan, reflect, research)
