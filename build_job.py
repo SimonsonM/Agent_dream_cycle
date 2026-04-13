@@ -40,6 +40,7 @@ def apply_action(action: dict, staged_file: Path, applied_dir: Path) -> bool:
             model_name = shlex.split(content)[-1]
             result = subprocess.run(shlex.split(content),
                                     capture_output=True, text=True, timeout=300)
+            result = subprocess.run(shlex.split(content), capture_output=True, text=True, timeout=300)
             if result.returncode != 0:
                 log(f"    Model pull failed: {result.stderr}")
                 return False

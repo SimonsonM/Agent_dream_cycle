@@ -195,6 +195,115 @@ def get_agent_dirs(agent_name: str) -> dict:
 # ── Model selection ───────────────────────────────────────────────────────────
 
 def list_ollama_models() -> list[str]:
+# ── Paths ──────────────────────────────────────────────────────────────────────
+BASE_DIR = Path.home() / "dream-cycle"
+STAGING_DIR = BASE_DIR / "dream-staging"
+APPLIED_DIR = STAGING_DIR / "applied"
+LOGS_DIR = Path.home() / "dream-logs"
+PERF_LOG = BASE_DIR / "performance.jsonl"
+CONFIG_FILE = BASE_DIR / "config.json"
+
+for d in [STAGING_DIR, APPLIED_DIR, LOGS_DIR]:
+    d.mkdir(parents=True, exist_ok=True)
+
+# ── Models ─────────────────────────────────────────────────────────────────────
+LOCAL_MODEL = ""                    # set at runtime from config or interactive selection
+CLAUDE_MODEL = "claude-sonnet-4-6"  # Anthropic — deep research + judge
+
+TRACKS = ["AI/ML", "Cybersecurity", "Robotics/CV", "Data Analytics", "Project Management"]
+
+client = anthropic.Anthropic()
+
+# ── Config ─────────────────────────────────────────────────────────────────────
+
+def load_config() -> dict:
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def save_config(config: dict):
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(config, f, indent=2)
+
+# ── Model selection ────────────────────────────────────────────────────────────
+
+def list_ollama_models() -> list[str]:
+    try:
+        r = requests.get("http://localhost:11434/api/tags", timeout=10)
+        r.raise_for_status()
+        return [m["name"] for m in r.json().get("models", [])]
+    except Exception:
+        return []
+
+def pull_ollama_model(model_name: str) -> bool:
+    print(f"Pulling {model_name} (this may take a while)...")
+    try:
+        result = subprocess.run(["ollama", "pull", model_name], timeout=600)
+        return result.returncode == 0
+    except Exception as e:
+        print(f"Pull failed: {e}")
+        return False
+
+def select_local_model() -> str:
+    """Interactively pick an installed Ollama model or pull a new one."""
+    print("\n── Local Model Selection ──────────────────────────────────────")
+    available = list_ollama_models()
+
+    options = available + ["Pull a different model"]
+    for i, opt in enumerate(options, 1):
+        print(f"  {i}. {opt}")
+    print()
+
+    while True:
+        try:
+            raw = input(f"Select [1-{len(options)}]: ").strip()
+            idx = int(raw) - 1
+            if 0 <= idx < len(available):
+                return available[idx]
+            elif idx == len(available):
+                break
+            else:
+                print(f"  Enter a number between 1 and {len(options)}")
+        except (ValueError, EOFError):
+            print("  Enter a number")
+
+    # Pull path
+    model_name = input("Model name to pull (e.g. qwen2.5:7b): ").strip()
+    if model_name:
+        pull_ollama_model(model_name)
+        return model_name
+    return "qwen2.5:7b"
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def log(msg: str):
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts}] {msg}", flush=True)
+
+def extract_json(text: str) -> dict:
+    """Extract the first valid JSON object from an LLM response."""
+    decoder = json.JSONDecoder()
+    for i, ch in enumerate(text):
+        if ch == '{':
+            try:
+                obj, _ = decoder.raw_decode(text, i)
+                return obj
+            except json.JSONDecodeError:
+                continue
+    raise ValueError("No JSON object found in response")
+
+def ollama_chat(prompt: str, system: str = "") -> str:
+    payload = {
+        "model": LOCAL_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+    }
+    if system:
+        payload["messages"].insert(0, {"role": "system", "content": system})
     try:
         r = requests.get("http://localhost:11434/api/tags", timeout=10)
         r.raise_for_status()
@@ -571,6 +680,9 @@ def phase_deep_research(profile: dict, scan_results: dict) -> dict:
         return {"research": [], "synthesis": ""}
 
     enriched = ollama_enrich_findings(findings, profile)
+        log("No findings from Phase 1, skipping Phase 3")
+        return {"research": [], "cross_connections": ""}
+    priority = scan_results.get("priority_track", "AI/ML")
 
     log("Phase 3b: Claude deep synthesis...")
     prompt = f"""You are the deep research phase of a {profile['name']}.
@@ -800,6 +912,26 @@ def main():
     send_gmail_summary(changelog_path, judge, scan, agent_name)
 
     log(f"=== Complete. {len(manifest)} actions staged. ===")
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    log(f"=== Dream Cycle Starting — {date_str} ===")
+
+    # Load persisted model, or prompt once and save it
+    config = load_config()
+    if not config.get("local_model"):
+        config["local_model"] = select_local_model()
+        save_config(config)
+    LOCAL_MODEL = config["local_model"]
+    log(f"Local model: {LOCAL_MODEL}")
+
+    scan = phase_scan()
+    reflect = phase_reflect()
+    research = phase_deep_research(scan)
+    judge = phase_judge_and_stage(scan, reflect, research)
+    manifest = write_staging(judge, date_str)
+    changelog_path = write_changelog(date_str, scan, reflect, research, judge, manifest)
+    send_gmail_summary(changelog_path, judge, scan)
+
+    log(f"=== Dream Cycle Complete. {len(manifest)} actions staged. ===")
 
 if __name__ == "__main__":
     main()
