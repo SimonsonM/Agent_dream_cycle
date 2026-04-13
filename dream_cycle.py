@@ -1,60 +1,164 @@
 #!/usr/bin/env python3
 """
-Dream Cycle Orchestrator
-Runs nightly at 11:15 PM via cron.
-Four phases: Scan → Reflect → Deep Research → Judge + Stage
+Dream Cycle Orchestrator — Multi-Agent Edition
+Runs nightly via cron.
+
+Usage:
+  dream_cycle.py                          # run default agent (ai_research)
+  dream_cycle.py --agent security         # run specific agent
+  dream_cycle.py --agent security --reconfigure
+  dream_cycle.py --list-agents
 """
 
+import argparse
+import hashlib
 import json
 import os
+import shlex
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import anthropic
 import requests
 import xml.etree.ElementTree as ET
 
-# ── Paths ──────────────────────────────────────────────────────────────────────
-BASE_DIR = Path.home() / "dream-cycle"
-STAGING_DIR = BASE_DIR / "dream-staging"
-APPLIED_DIR = STAGING_DIR / "applied"
-LOGS_DIR = Path.home() / "dream-logs"
-PERF_LOG = BASE_DIR / "performance.jsonl"
+# ── Paths ─────────────────────────────────────────────────────────────────────
+BASE_DIR    = Path.home() / "dream-cycle"
+LOGS_DIR    = Path.home() / "dream-logs"
 CONFIG_FILE = BASE_DIR / "config.json"
 
-for d in [STAGING_DIR, APPLIED_DIR, LOGS_DIR]:
-    d.mkdir(parents=True, exist_ok=True)
+BASE_DIR.mkdir(parents=True, exist_ok=True)
+LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
-# ── Models ─────────────────────────────────────────────────────────────────────
-LOCAL_MODEL = ""                    # set at runtime from config or interactive selection
-CLAUDE_MODEL = "claude-sonnet-4-6"  # Anthropic — deep research + judge
+# ── Models ────────────────────────────────────────────────────────────────────
+LOCAL_MODEL  = ""
+CLAUDE_MODEL = "claude-sonnet-4-6"
+client       = anthropic.Anthropic()
 
-TRACKS = ["AI/ML", "Cybersecurity", "Robotics/CV", "Data Analytics", "Project Management"]
+# ── Agent Profiles ────────────────────────────────────────────────────────────
+AGENT_PROFILES = {
+    "security": {
+        "name": "Security Research Agent",
+        "tracks": [
+            "CVE/Vulnerability Research", "Threat Intelligence",
+            "Malware Analysis", "Zero-Day Exploits", "Security Tooling",
+        ],
+        "arxiv_queries": [
+            ("cybersecurity vulnerability detection exploit adversarial", 8),
+            ("malware detection machine learning intrusion", 5),
+            ("network security anomaly detection zero-day", 5),
+        ],
+        "default_github_repos": [
+            "projectdiscovery/nuclei",
+            "aquasecurity/trivy",
+            "rapid7/metasploit-framework",
+            "nmap/nmap",
+            "OWASP/owasp-mstg",
+        ],
+        "fetch_cves": True,
+        "fetch_github_trending": False,
+        "context": (
+            "Focus on exploitability, CVE severity, defensive tooling, "
+            "and threat actor TTPs. Cross-reference MITRE ATT&CK where applicable."
+        ),
+    },
+    "marketing": {
+        "name": "Marketing Intelligence Agent",
+        "tracks": [
+            "Growth Hacking", "SEO/SEM", "Content Strategy",
+            "MarTech Stack", "Analytics & Attribution",
+        ],
+        "arxiv_queries": [
+            ("recommendation systems user engagement personalization", 5),
+            ("natural language generation content marketing automation", 5),
+            ("causal inference A/B testing conversion rate optimization", 4),
+        ],
+        "default_github_repos": [
+            "apache/superset",
+            "metabase/metabase",
+            "PostHog/posthog",
+            "plausible/analytics",
+            "matomo-org/matomo",
+        ],
+        "fetch_cves": False,
+        "fetch_github_trending": False,
+        "context": (
+            "Focus on conversion rate impact, SEO ranking signals, "
+            "content distribution leverage, and MarTech integrations "
+            "that reduce manual work."
+        ),
+    },
+    "programming": {
+        "name": "Programming Intelligence Agent",
+        "tracks": [
+            "AI/ML Engineering", "Web Development", "DevOps/Infrastructure",
+            "Language Updates", "Developer Tooling",
+        ],
+        "arxiv_queries": [
+            ("machine learning engineering MLOps deployment optimization", 8),
+            ("large language model fine-tuning efficient inference", 6),
+            ("distributed systems reliability fault tolerance", 5),
+        ],
+        "default_github_repos": [
+            "astral-sh/uv",
+            "astral-sh/ruff",
+            "microsoft/TypeScript",
+            "vercel/next.js",
+            "docker/compose",
+        ],
+        "fetch_cves": False,
+        "fetch_github_trending": True,
+        "context": (
+            "Focus on language runtime changes, breaking API changes, "
+            "new tooling that replaces existing workflow steps, and "
+            "infrastructure patterns that reduce operational overhead."
+        ),
+    },
+    "ai_research": {
+        "name": "AI Research Agent",
+        "tracks": [
+            "LLM Research", "Computer Vision", "Robotics",
+            "AI Safety & Alignment", "Multimodal Models",
+        ],
+        "arxiv_queries": [
+            ("large language model reasoning chain-of-thought agents tool use", 10),
+            ("computer vision object detection transformer", 7),
+            ("robotics reinforcement learning manipulation", 6),
+            ("AI safety alignment value learning interpretability", 6),
+            ("multimodal vision language foundation model", 5),
+        ],
+        "default_github_repos": [
+            "huggingface/transformers",
+            "ollama/ollama",
+            "anthropics/anthropic-sdk-python",
+            "facebookresearch/segment-anything",
+            "ggerganov/llama.cpp",
+        ],
+        "fetch_cves": False,
+        "fetch_github_trending": True,
+        "context": (
+            "Focus on benchmark improvements, architectural innovations, "
+            "training efficiency breakthroughs, and safety implications. "
+            "Note when a paper challenges current best practices."
+        ),
+    },
+}
 
-DEFAULT_RSS_FEEDS = [
-    {"name": "Hacker News",        "url": "https://news.ycombinator.com/rss",                                  "track": "AI/ML"},
-    {"name": "HuggingFace Blog",   "url": "https://huggingface.co/blog/feed.xml",                              "track": "AI/ML"},
-    {"name": "Anthropic Blog",     "url": "https://www.anthropic.com/rss.xml",                                 "track": "AI/ML"},
-    {"name": "MIT AI News",        "url": "https://news.mit.edu/topic/artificial-intelligence2/feed",          "track": "AI/ML"},
-    {"name": "Krebs on Security",  "url": "https://krebsonsecurity.com/feed/",                                 "track": "Cybersecurity"},
-    {"name": "The Hacker News",    "url": "https://feeds.feedburner.com/TheHackersNews",                       "track": "Cybersecurity"},
-    {"name": "Dark Reading",       "url": "https://www.darkreading.com/rss.xml",                               "track": "Cybersecurity"},
-    {"name": "IEEE Spectrum AI",   "url": "https://spectrum.ieee.org/feeds/topic/artificial-intelligence.rss", "track": "AI/ML"},
-    {"name": "IEEE Robotics",      "url": "https://spectrum.ieee.org/feeds/topic/robotics.rss",                "track": "Robotics/CV"},
-    {"name": "Towards Data Sci.",  "url": "https://towardsdatascience.com/feed",                               "track": "Data Analytics"},
-]
-
-client = anthropic.Anthropic()
-
-# ── Config ─────────────────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────────
 
 def load_config() -> dict:
     if CONFIG_FILE.exists():
         try:
             with open(CONFIG_FILE) as f:
-                return json.load(f)
+                raw = json.load(f)
+            # Migrate old flat format
+            if "local_model" in raw and "global" not in raw:
+                migrated = {"global": {"local_model": raw["local_model"]}, "agents": {}}
+                save_config(migrated)
+                return migrated
+            return raw
         except Exception:
             pass
     return {}
@@ -63,7 +167,32 @@ def save_config(config: dict):
     with open(CONFIG_FILE, "w") as f:
         json.dump(config, f, indent=2)
 
-# ── Model selection ────────────────────────────────────────────────────────────
+def get_agent_config(config: dict, agent_name: str) -> dict:
+    return config.get("agents", {}).get(agent_name, {})
+
+def set_agent_config(config: dict, agent_name: str, agent_cfg: dict) -> dict:
+    config.setdefault("agents", {})[agent_name] = agent_cfg
+    return config
+
+# ── Per-agent directories ─────────────────────────────────────────────────────
+
+def get_agent_dirs(agent_name: str) -> dict:
+    agent_dir   = BASE_DIR / agent_name
+    staging_dir = agent_dir / "staging"
+    applied_dir = staging_dir / "applied"
+    logs_dir    = agent_dir / "logs"
+    for d in [staging_dir, applied_dir, logs_dir]:
+        d.mkdir(parents=True, exist_ok=True)
+    return {
+        "agent_dir":   agent_dir,
+        "staging_dir": staging_dir,
+        "applied_dir": applied_dir,
+        "logs_dir":    logs_dir,
+        "perf_log":    agent_dir / "performance.jsonl",
+        "seen_cache":  agent_dir / "seen_cache.json",
+    }
+
+# ── Model selection ───────────────────────────────────────────────────────────
 
 def list_ollama_models() -> list[str]:
     try:
@@ -83,142 +212,205 @@ def pull_ollama_model(model_name: str) -> bool:
         return False
 
 def select_local_model() -> str:
-    """Interactively pick an installed Ollama model or pull a new one."""
     print("\n── Local Model Selection ──────────────────────────────────────")
     available = list_ollama_models()
-
-    options = available + ["Pull a different model"]
+    options   = available + ["Pull a different model"]
     for i, opt in enumerate(options, 1):
         print(f"  {i}. {opt}")
     print()
-
     while True:
         try:
-            raw = input(f"Select [1-{len(options)}]: ").strip()
-            idx = int(raw) - 1
+            idx = int(input(f"Select [1-{len(options)}]: ").strip()) - 1
             if 0 <= idx < len(available):
                 return available[idx]
             elif idx == len(available):
                 break
-            else:
-                print(f"  Enter a number between 1 and {len(options)}")
+            print(f"  Enter a number between 1 and {len(options)}")
         except (ValueError, EOFError):
             print("  Enter a number")
-
-    # Pull path
-    model_name = input("Model name to pull (e.g. qwen2.5:7b): ").strip()
-    if model_name:
-        pull_ollama_model(model_name)
-        return model_name
+    name = input("Model name to pull (e.g. qwen2.5:7b): ").strip()
+    if name:
+        pull_ollama_model(name)
+        return name
     return "qwen2.5:7b"
 
-# ── RSS feeds ─────────────────────────────────────────────────────────────────
+# ── Agent setup ───────────────────────────────────────────────────────────────
 
-def fetch_rss_feed(feed: dict, max_items: int = 5) -> list[dict]:
-    """Fetch and parse a single RSS 2.0 or Atom feed."""
-    url, name = feed["url"], feed["name"]
+def configure_agent(agent_name: str, profile: dict) -> dict:
+    print(f"\n── Configuring {profile['name']} ─────────────────────────────")
+    print(f"Tracks: {', '.join(profile['tracks'])}\n")
+    print("Default GitHub repos to watch for releases:")
+    for i, repo in enumerate(profile["default_github_repos"], 1):
+        print(f"  {i}. {repo}")
+    raw = input("\nKeep all, or enter comma-separated list [all]: ").strip()
+    if raw.lower() in ("", "all"):
+        github_repos = list(profile["default_github_repos"])
+    else:
+        github_repos = [r.strip() for r in raw.split(",") if r.strip()]
+    while True:
+        extra = input("Add another repo (owner/name, Enter to skip): ").strip()
+        if not extra:
+            break
+        github_repos.append(extra)
+    return {"github_repos": github_repos}
+
+# ── Seen-items cache ──────────────────────────────────────────────────────────
+
+CACHE_TTL_DAYS = 7
+
+def item_hash(title: str, link: str) -> str:
+    return hashlib.sha256(f"{title.strip()}{link.strip()}".encode()).hexdigest()[:16]
+
+def load_seen_cache(cache_path: Path) -> dict:
+    if not cache_path.exists():
+        return {}
     try:
-        r = requests.get(url, timeout=30, headers={"User-Agent": "DreamCycle/1.0"})
-        r.raise_for_status()
-        root = ET.fromstring(r.content)
+        with open(cache_path) as f:
+            return json.load(f)
+    except Exception:
+        return {}
 
-        # Detect format: Atom feeds have a namespace containing 'atom' or use <feed> root
-        raw_tag = root.tag
-        ns_uri = raw_tag[1:raw_tag.index("}")] if raw_tag.startswith("{") else ""
-        is_atom = "atom" in ns_uri or root.tag.endswith("feed")
-        p = f"{{{ns_uri}}}" if ns_uri else ""
+def save_seen_cache(cache_path: Path, cache: dict):
+    cutoff = (datetime.now() - timedelta(days=CACHE_TTL_DAYS * 2)).isoformat()
+    pruned = {k: v for k, v in cache.items() if v >= cutoff}
+    with open(cache_path, "w") as f:
+        json.dump(pruned, f)
 
-        items = []
-        if is_atom:
-            for entry in root.findall(f"{p}entry")[:max_items]:
-                title_el  = entry.find(f"{p}title")
-                link_el   = entry.find(f"{p}link")
-                summ_el   = entry.find(f"{p}summary") or entry.find(f"{p}content")
-                items.append({
-                    "title":   (title_el.text or "").strip(),
-                    "link":    link_el.get("href", "") if link_el is not None else "",
-                    "summary": (summ_el.text or "")[:400].strip() if summ_el is not None else "",
-                    "source":  name,
-                    "track":   feed.get("track", "AI/ML"),
-                })
-        else:
-            channel = root.find("channel")
-            if channel is None:
-                return []
-            for item in channel.findall("item")[:max_items]:
-                title_el = item.find("title")
-                link_el  = item.find("link")
-                desc_el  = item.find("description")
-                items.append({
-                    "title":   (title_el.text or "").strip() if title_el is not None else "",
-                    "link":    (link_el.text or "").strip()  if link_el  is not None else "",
-                    "summary": (desc_el.text  or "")[:400].strip() if desc_el is not None else "",
-                    "source":  name,
-                    "track":   feed.get("track", "AI/ML"),
-                })
+def filter_seen(items: list[dict], cache: dict) -> list[dict]:
+    cutoff = (datetime.now() - timedelta(days=CACHE_TTL_DAYS)).isoformat()
+    now    = datetime.now().isoformat()
+    fresh  = []
+    for item in items:
+        h  = item_hash(item.get("title", ""), item.get("link", ""))
+        ts = cache.get(h)
+        if ts is None or ts < cutoff:
+            fresh.append(item)
+        cache.setdefault(h, now)
+    skipped = len(items) - len(fresh)
+    if skipped:
+        log(f"  Dedup cache: skipped {skipped} already-seen items")
+    return fresh
+
+# ── Keyword pre-filter ────────────────────────────────────────────────────────
+
+def keyword_score(item: dict, tracks: list[str]) -> int:
+    keywords = set()
+    for t in tracks:
+        for w in t.lower().replace("/", " ").replace("&", " ").split():
+            if len(w) > 3:
+                keywords.add(w)
+    text = " ".join([
+        item.get("title", ""), item.get("summary", ""),
+        item.get("track", ""), item.get("source", ""),
+    ]).lower()
+    return sum(1 for kw in keywords if kw in text)
+
+def top_k_items(items: list[dict], tracks: list[str], k: int = 40) -> list[dict]:
+    if len(items) <= k:
         return items
+    scored = sorted(items, key=lambda x: keyword_score(x, tracks), reverse=True)
+    log(f"  Pre-filter: kept {k}/{len(items)} most relevant items")
+    return scored[:k]
+
+# ── Data fetchers ─────────────────────────────────────────────────────────────
+
+def fetch_arxiv(query: str, max_results: int = 10) -> list[dict]:
+    try:
+        r    = requests.get("http://export.arxiv.org/api/query",
+                            params={"search_query": query, "max_results": max_results,
+                                    "sortBy": "submittedDate"}, timeout=30)
+        root = ET.fromstring(r.text)
+        ns   = {"atom": "http://www.w3.org/2005/Atom"}
+        return [{
+            "title":   entry.find("atom:title",   ns).text.strip(),
+            "summary": entry.find("atom:summary", ns).text.strip()[:500],
+            "link":    entry.find("atom:id",      ns).text.strip(),
+            "source":  "arxiv",
+        } for entry in root.findall("atom:entry", ns)]
     except Exception as e:
-        log(f"RSS fetch error ({name}): {e}")
+        log(f"arXiv error: {e}")
         return []
 
-def fetch_all_rss_feeds(feeds: list[dict]) -> list[dict]:
+def fetch_github_trending() -> list[dict]:
+    try:
+        r = requests.get(
+            "https://api.github.com/search/repositories",
+            params={"q": "ai agent machine-learning", "sort": "stars",
+                    "order": "desc", "per_page": 10},
+            headers={"Accept": "application/vnd.github.v3+json"},
+            timeout=30,
+        )
+        return [{
+            "title":   x["full_name"],
+            "summary": x.get("description", ""),
+            "link":    x.get("html_url", ""),
+            "source":  "github_trending",
+            "stars":   x["stargazers_count"],
+        } for x in r.json().get("items", [])]
+    except Exception as e:
+        log(f"GitHub trending error: {e}")
+        return []
+
+def fetch_github_releases(repos: list[str]) -> list[dict]:
     results = []
-    for feed in feeds:
-        items = fetch_rss_feed(feed)
-        results.extend(items)
-        if items:
-            log(f"  RSS [{feed['name']}]: {len(items)} items")
+    for repo in repos:
+        try:
+            r = requests.get(
+                f"https://api.github.com/repos/{repo}/releases",
+                params={"per_page": 2},
+                headers={"Accept": "application/vnd.github.v3+json"},
+                timeout=15,
+            )
+            if r.status_code == 200:
+                for rel in r.json():
+                    results.append({
+                        "title":   f"{repo} {rel.get('tag_name', '')}",
+                        "summary": (rel.get("body") or "")[:300],
+                        "link":    rel.get("html_url", ""),
+                        "source":  "github_release",
+                    })
+        except Exception as e:
+            log(f"GitHub release error ({repo}): {e}")
     return results
 
-def configure_rss_feeds() -> list[dict]:
-    """Interactively select RSS feeds to subscribe to."""
-    print("\n── RSS Feed Selection ─────────────────────────────────────────")
-    print("Select feeds to follow (comma-separated numbers, 'all', or 'none'):\n")
-    for i, f in enumerate(DEFAULT_RSS_FEEDS, 1):
-        print(f"  {i:2}. [{f['track']:15}] {f['name']}")
-    print()
+def fetch_cve_recent() -> list[dict]:
+    try:
+        r = requests.get(
+            "https://services.nvd.nist.gov/rest/json/cves/2.0",
+            params={"resultsPerPage": 10, "startIndex": 0},
+            timeout=30,
+        )
+        return [{
+            "title":   x["cve"]["id"],
+            "summary": x["cve"]["descriptions"][0]["value"][:300] if x["cve"]["descriptions"] else "",
+            "link":    f"https://nvd.nist.gov/vuln/detail/{x['cve']['id']}",
+            "source":  "nvd_cve",
+        } for x in r.json().get("vulnerabilities", [])]
+    except Exception as e:
+        log(f"CVE error: {e}")
+        return []
 
-    while True:
-        raw = input("Selection [all]: ").strip().lower() or "all"
-        if raw == "all":
-            selected = list(DEFAULT_RSS_FEEDS)
-            break
-        if raw == "none":
-            selected = []
-            break
-        try:
-            indices = [int(x.strip()) - 1 for x in raw.split(",")]
-            if all(0 <= i < len(DEFAULT_RSS_FEEDS) for i in indices):
-                selected = [DEFAULT_RSS_FEEDS[i] for i in indices]
-                break
-            print(f"  Numbers must be between 1 and {len(DEFAULT_RSS_FEEDS)}")
-        except ValueError:
-            print("  Enter numbers separated by commas, 'all', or 'none'")
+def load_perf_log(perf_log_path: Path) -> list[dict]:
+    if not perf_log_path.exists():
+        return []
+    entries = []
+    with open(perf_log_path) as f:
+        for line in f:
+            try:
+                entries.append(json.loads(line))
+            except Exception:
+                pass
+    return entries[-50:]
 
-    # Allow custom feed URLs
-    print(f"\n{len(selected)} feed(s) selected.")
-    while True:
-        custom = input("Add a custom feed URL? (paste URL or press Enter to skip): ").strip()
-        if not custom:
-            break
-        custom_name = input("  Name for this feed: ").strip() or custom
-        custom_track = input(f"  Track ({'/'.join(TRACKS)}): ").strip() or "AI/ML"
-        selected.append({"name": custom_name, "url": custom, "track": custom_track})
-        print(f"  Added: {custom_name}")
-
-    return selected
-
-# ── Helpers ────────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def log(msg: str):
-    ts = datetime.now().strftime("%H:%M:%S")
-    print(f"[{ts}] {msg}", flush=True)
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 def extract_json(text: str) -> dict:
-    """Extract the first valid JSON object from an LLM response."""
     decoder = json.JSONDecoder()
     for i, ch in enumerate(text):
-        if ch == '{':
+        if ch == "{":
             try:
                 obj, _ = decoder.raw_decode(text, i)
                 return obj
@@ -227,11 +419,8 @@ def extract_json(text: str) -> dict:
     raise ValueError("No JSON object found in response")
 
 def ollama_chat(prompt: str, system: str = "") -> str:
-    payload = {
-        "model": LOCAL_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "stream": False,
-    }
+    payload = {"model": LOCAL_MODEL,
+               "messages": [{"role": "user", "content": prompt}], "stream": False}
     if system:
         payload["messages"].insert(0, {"role": "system", "content": system})
     try:
@@ -243,115 +432,88 @@ def ollama_chat(prompt: str, system: str = "") -> str:
         return ""
 
 def claude_chat(prompt: str, system: str = "") -> str:
-    kwargs = {
-        "model": CLAUDE_MODEL,
-        "max_tokens": 4096,
-        "messages": [{"role": "user", "content": prompt}],
-    }
+    kwargs = {"model": CLAUDE_MODEL, "max_tokens": 4096,
+              "messages": [{"role": "user", "content": prompt}]}
     if system:
         kwargs["system"] = system
     try:
-        msg = client.messages.create(**kwargs)
-        return msg.content[0].text
+        return client.messages.create(**kwargs).content[0].text
     except Exception as e:
         log(f"Claude error: {e}")
         return ""
 
-def fetch_arxiv(query: str, max_results: int = 10) -> list[dict]:
-    url = "http://export.arxiv.org/api/query"
-    params = {"search_query": query, "max_results": max_results, "sortBy": "submittedDate"}
-    try:
-        r = requests.get(url, params=params, timeout=30)
-        root = ET.fromstring(r.text)
-        ns = {"atom": "http://www.w3.org/2005/Atom"}
-        papers = []
-        for entry in root.findall("atom:entry", ns):
-            papers.append({
-                "title": entry.find("atom:title", ns).text.strip(),
-                "summary": entry.find("atom:summary", ns).text.strip()[:500],
-                "link": entry.find("atom:id", ns).text.strip(),
-            })
-        return papers
-    except Exception as e:
-        log(f"arXiv fetch error: {e}")
-        return []
+# ── Ollama helpers (token savers) ─────────────────────────────────────────────
 
-def fetch_github_trending() -> list[dict]:
-    try:
-        r = requests.get(
-            "https://api.github.com/search/repositories",
-            params={"q": "ai agent machine-learning", "sort": "stars", "order": "desc", "per_page": 10},
-            headers={"Accept": "application/vnd.github.v3+json"},
-            timeout=30,
+def ollama_enrich_findings(findings: list[dict], profile: dict) -> list[dict]:
+    """Add a brief local context note to each finding before Claude sees them."""
+    log("Phase 3a: Ollama pre-enrichment...")
+    tracks_str = ", ".join(profile["tracks"])
+    for finding in findings:
+        prompt = (
+            f"In 1-2 sentences, add technical context for a researcher focused on: {tracks_str}.\n"
+            f"Title: {finding.get('title', '')}\n"
+            f"Summary: {finding.get('summary', '')}\n"
+            f"Response (plain text, 1-2 sentences only):"
         )
-        repos = r.json().get("items", [])
-        return [{"name": x["full_name"], "description": x.get("description", ""), "stars": x["stargazers_count"]} for x in repos]
-    except Exception as e:
-        log(f"GitHub fetch error: {e}")
-        return []
+        ctx = ollama_chat(prompt)
+        finding["ollama_context"] = ctx.strip()[:300] if ctx else ""
+    return findings
 
-def fetch_cve_recent() -> list[dict]:
+def ollama_compress(scan: dict, reflect: dict) -> dict:
+    """Compress scan+reflect with Ollama before sending to Claude in Phase 4."""
+    prompt = (
+        "Summarize these two research outputs in under 600 words total. "
+        "Keep: priority track, top finding titles+scores, key observations, "
+        "suggested improvement.\n\n"
+        f"SCAN: {json.dumps(scan)[:2000]}\n"
+        f"REFLECT: {json.dumps(reflect)[:800]}\n\n"
+        'Return JSON: {"scan_summary": "...", "reflect_summary": "..."}'
+    )
+    result = ollama_chat(prompt)
     try:
-        r = requests.get(
-            "https://services.nvd.nist.gov/rest/json/cves/2.0",
-            params={"resultsPerPage": 10, "startIndex": 0},
-            timeout=30,
-        )
-        items = r.json().get("vulnerabilities", [])
-        return [
-            {
-                "id": x["cve"]["id"],
-                "description": x["cve"]["descriptions"][0]["value"][:300] if x["cve"]["descriptions"] else "",
-            }
-            for x in items
-        ]
-    except Exception as e:
-        log(f"CVE fetch error: {e}")
-        return []
+        return extract_json(result)
+    except Exception:
+        return {"scan_summary":    json.dumps(scan)[:600],
+                "reflect_summary": json.dumps(reflect)[:400]}
 
-def load_perf_log() -> list[dict]:
-    if not PERF_LOG.exists():
-        return []
-    entries = []
-    with open(PERF_LOG) as f:
-        for line in f:
-            try:
-                entries.append(json.loads(line))
-            except Exception:
-                pass
-    return entries[-50:]  # last 50 events
+# ── Phase 1: Scan ─────────────────────────────────────────────────────────────
 
-# ── Phase 1: Scan ──────────────────────────────────────────────────────────────
-
-def phase_scan(rss_feeds: list[dict] = None) -> dict:
+def phase_scan(profile: dict, agent_cfg: dict, seen_cache: dict) -> dict:
     log("Phase 1: Scanning sources...")
 
-    arxiv_ai = fetch_arxiv("machine learning agents LLM", 8)
-    arxiv_cv = fetch_arxiv("computer vision robotics OpenCV", 5)
-    arxiv_sec = fetch_arxiv("cybersecurity vulnerability detection", 5)
-    github = fetch_github_trending()
-    cves = fetch_cve_recent()
-    rss_items = fetch_all_rss_feeds(rss_feeds) if rss_feeds else []
+    all_items: list[dict] = []
 
-    raw = {
-        "arxiv_ai": arxiv_ai,
-        "arxiv_cv": arxiv_cv,
-        "arxiv_sec": arxiv_sec,
-        "github_trending": github,
-        "recent_cves": cves,
-        "rss_feeds": rss_items,
-    }
+    for query, n in profile["arxiv_queries"]:
+        all_items.extend(fetch_arxiv(query, n))
 
-    prompt = f"""You are the scan phase of a nightly research agent for a technical consultant
-working across: {', '.join(TRACKS)}.
+    if profile.get("fetch_github_trending"):
+        all_items.extend(fetch_github_trending())
 
-Here is tonight's raw data (includes arXiv papers, GitHub trending, CVEs, and RSS feed items):
-{json.dumps(raw, indent=2)[:8000]}
+    if profile.get("fetch_cves"):
+        all_items.extend(fetch_cve_recent())
+
+    watched = agent_cfg.get("github_repos", [])
+    if watched:
+        releases = fetch_github_releases(watched)
+        log(f"  GitHub releases: {len(releases)} items from {len(watched)} repos")
+        all_items.extend(releases)
+
+    log(f"  Collected {len(all_items)} raw items")
+    fresh    = filter_seen(all_items, seen_cache)
+    filtered = top_k_items(fresh, profile["tracks"])
+
+    prompt = f"""You are the scan phase of a nightly research agent.
+Agent: {profile['name']}
+Context: {profile['context']}
+Tracks: {', '.join(profile['tracks'])}
+
+Tonight's items ({len(filtered)} pre-scored for relevance):
+{json.dumps(filtered, indent=2)[:8000]}
 
 Tasks:
-1. Score each item 1-10 for relevance across all tracks
-2. Pick tonight's TOP PRIORITY TRACK based on what's freshest and most actionable
-3. Select the 5 most important findings overall
+1. Score each item 1-10 for relevance to this agent's tracks
+2. Pick tonight's TOP PRIORITY TRACK
+3. Select the 5 most important, actionable findings
 4. Return JSON only:
 {{
   "priority_track": "...",
@@ -365,26 +527,26 @@ Tasks:
     try:
         return extract_json(result)
     except Exception:
-        log("Scan parse failed, using raw structure")
-        return {"priority_track": "AI/ML", "priority_reason": "parse error", "top_findings": []}
+        log("Scan parse failed")
+        return {"priority_track": profile["tracks"][0],
+                "priority_reason": "parse error", "top_findings": []}
 
-# ── Phase 2: Reflect ───────────────────────────────────────────────────────────
+# ── Phase 2: Reflect ──────────────────────────────────────────────────────────
 
-def phase_reflect() -> dict:
-    log("Phase 2: Reflecting on today's performance...")
-
-    perf = load_perf_log()
+def phase_reflect(profile: dict, dirs: dict) -> dict:
+    log("Phase 2: Reflecting on performance...")
+    perf = load_perf_log(dirs["perf_log"])
     if not perf:
         return {"observations": ["No performance data yet."], "improvement_areas": []}
 
-    prompt = f"""You are the reflection phase of a nightly agent review.
-Here are today's agent performance events (tasks, outcomes, escalations):
+    prompt = f"""You are the reflection phase of a {profile['name']} nightly review.
+Performance events:
 {json.dumps(perf, indent=2)[:3000]}
 
 Analyze:
-1. What patterns do you see in failures or escalations?
-2. What tasks could have been handled by a cheaper/faster model?
-3. What's one concrete process improvement for tomorrow?
+1. What patterns appear in failures or escalations?
+2. What tasks could use a cheaper/faster model?
+3. One concrete process improvement for tomorrow?
 
 Return JSON only:
 {{
@@ -399,30 +561,30 @@ Return JSON only:
     except Exception:
         return {"observations": ["Reflection parse failed"], "improvement_areas": []}
 
-# ── Phase 3: Deep Research ─────────────────────────────────────────────────────
+# ── Phase 3: Deep Research ────────────────────────────────────────────────────
 
-def phase_deep_research(scan_results: dict) -> dict:
+def phase_deep_research(profile: dict, scan_results: dict) -> dict:
     log("Phase 3: Deep research via Claude...")
-
     findings = scan_results.get("top_findings", [])
     if not findings:
-        log("No findings from Phase 1, skipping Phase 3")
-        return {"research": [], "cross_connections": ""}
-    priority = scan_results.get("priority_track", "AI/ML")
+        log("  No findings, skipping Phase 3")
+        return {"research": [], "synthesis": ""}
 
-    prompt = f"""You are the deep research phase of a nightly agent.
-Tonight's priority track: {priority}
+    enriched = ollama_enrich_findings(findings, profile)
 
-Top findings to research deeply:
-{json.dumps(findings, indent=2)}
+    log("Phase 3b: Claude deep synthesis...")
+    prompt = f"""You are the deep research phase of a {profile['name']}.
+Tracks: {', '.join(profile['tracks'])}
+Context: {profile['context']}
+
+Top findings (each has a local pre-research context note):
+{json.dumps(enriched, indent=2)[:5000]}
 
 For each finding:
-1. Explain what it actually is and why it matters
-2. Assess direct applicability to: AI/ML stack (Ollama, MCP servers, Claude API),
-   robotics project (Raspberry Pi, OpenCV, MediaPipe, rover chassis),
-   cybersecurity consulting, or data analytics work
-3. Identify if it suggests any change to current tools, workflows, or configs
-4. If iterative depth applies (a finding builds on another finding), note it
+1. Expand on what it means and why it matters for these tracks
+2. Identify direct applicability to current tools/workflows
+3. Flag any suggested changes with specifics
+4. Note cross-connections between findings
 
 Return JSON:
 {{
@@ -432,12 +594,11 @@ Return JSON:
       "deep_summary": "...",
       "applicability": "high|medium|low",
       "applicable_to": ["..."],
-      "suggests_change": true/false,
-      "change_description": "...",
-      "iterative_depth": "..."
+      "suggests_change": true,
+      "change_description": "..."
     }}
   ],
-  "cross_connections": "..."
+  "synthesis": "..."
 }}"""
 
     result = claude_chat(prompt)
@@ -445,25 +606,27 @@ Return JSON:
         return extract_json(result)
     except Exception:
         log("Deep research parse failed")
-        return {"research": [], "cross_connections": ""}
+        return {"research": [], "synthesis": ""}
 
-# ── Phase 4: Judge + Stage ─────────────────────────────────────────────────────
+# ── Phase 4: Judge + Stage ────────────────────────────────────────────────────
 
-def phase_judge_and_stage(scan: dict, reflect: dict, research: dict) -> dict:
+def phase_judge_and_stage(profile: dict, scan: dict, reflect: dict, research: dict) -> dict:
     log("Phase 4: Judging and staging changes...")
 
-    prompt = f"""You are the judgment phase of a nightly self-improving agent.
+    compressed = ollama_compress(scan, reflect)
 
-Scan results: {json.dumps(scan, indent=2)[:2000]}
-Reflection: {json.dumps(reflect, indent=2)}
+    prompt = f"""You are the judgment phase of a {profile['name']}.
+
+Scan summary: {compressed.get('scan_summary', '')}
+Reflection summary: {compressed.get('reflect_summary', '')}
 Deep research: {json.dumps(research, indent=2)[:3000]}
 
-Decide what actions to stage. Rules:
-- risk: low → safe to auto-apply at 4 AM (documentation updates, new model pulls, config tweaks)
-- risk: medium → stage for human review (workflow changes, new tool integrations)
-- risk: high → stage with detailed notes, never auto-apply (anything touching live systems)
+Decide what actions to stage:
+- risk: low   → safe to auto-apply at 4 AM (docs, config tweaks, model pulls)
+- risk: medium → stage for human review (workflow changes, integrations)
+- risk: high  → stage with notes, never auto-apply (live system changes)
 
-For each staged action, provide a rollback_command.
+Provide a rollback_command for each action.
 
 Return JSON:
 {{
@@ -489,52 +652,46 @@ Return JSON:
         log("Judge parse failed")
         return {"staged_actions": [], "summary": "Parse failed", "tonight_score": 0}
 
-# ── Write Staged Files ─────────────────────────────────────────────────────────
+# ── Write Staged Files ────────────────────────────────────────────────────────
 
-def write_staging(judge: dict, date_str: str):
-    actions = judge.get("staged_actions", [])
-    manifest = []
-
+def write_staging(judge: dict, date_str: str, dirs: dict) -> list:
+    staging_dir = dirs["staging_dir"]
+    actions     = judge.get("staged_actions", [])
+    manifest    = []
     for i, action in enumerate(actions):
-        risk = action.get("risk", "high")
+        risk  = action.get("risk", "high")
         fname = f"{date_str}_{i:02d}_{action.get('action_type', 'change')}_{risk}.staged"
-        fpath = STAGING_DIR / fname
-
+        fpath = staging_dir / fname
         with open(fpath, "w") as f:
             json.dump(action, f, indent=2)
-
         manifest.append({"file": str(fpath), "risk": risk, "title": action.get("title", "")})
         log(f"  Staged [{risk}]: {action.get('title', '')}")
-
-    manifest_path = STAGING_DIR / f"{date_str}_manifest.json"
-    with open(manifest_path, "w") as f:
+    with open(staging_dir / f"{date_str}_manifest.json", "w") as f:
         json.dump(manifest, f, indent=2)
-
     return manifest
 
-# ── Write Changelog ────────────────────────────────────────────────────────────
+# ── Write Changelog ───────────────────────────────────────────────────────────
 
-def write_changelog(date_str: str, scan: dict, reflect: dict, research: dict, judge: dict, manifest: list):
-    changelog = LOGS_DIR / f"{date_str}-changelog.md"
-
+def write_changelog(date_str: str, agent_name: str, profile: dict,
+                    scan: dict, reflect: dict, research: dict,
+                    judge: dict, manifest: list, dirs: dict) -> str:
+    changelog = dirs["logs_dir"] / f"{date_str}-changelog.md"
     lines = [
-        f"# Dream Cycle — {date_str}",
-        f"\n**Priority Track Tonight:** {scan.get('priority_track', '?')}  ",
+        f"# Dream Cycle — {profile['name']} — {date_str}",
+        f"\n**Priority Track:** {scan.get('priority_track', '?')}  ",
         f"**Reason:** {scan.get('priority_reason', '')}  ",
         f"**Score:** {judge.get('tonight_score', '?')}/10\n",
-        "---\n",
-        "## Phase 1 — Top Findings\n",
+        "---\n", "## Phase 1 — Top Findings\n",
     ]
-
-    for f in scan.get("top_findings", []):
-        lines.append(f"- **{f.get('title', '')}** `[{f.get('track', '')}]` score:{f.get('score', '?')}  ")
-        lines.append(f"  {f.get('summary', '')}\n")
+    for item in scan.get("top_findings", []):
+        lines.append(f"- **{item.get('title', '')}** `[{item.get('track', '')}]` score:{item.get('score', '?')}  ")
+        lines.append(f"  {item.get('summary', '')}\n")
 
     lines += ["\n## Phase 2 — Reflection\n"]
     for obs in reflect.get("observations", []):
         lines.append(f"- {obs}")
     if reflect.get("suggested_improvement"):
-        lines.append(f"\n**Tonight's Improvement Suggestion:** {reflect['suggested_improvement']}\n")
+        lines.append(f"\n**Improvement Suggestion:** {reflect['suggested_improvement']}\n")
 
     lines += ["\n## Phase 3 — Deep Research\n"]
     for r in research.get("research", []):
@@ -542,81 +699,107 @@ def write_changelog(date_str: str, scan: dict, reflect: dict, research: dict, ju
         lines.append(f"**Applicability:** {r.get('applicability', '?')} | **Tracks:** {', '.join(r.get('applicable_to', []))}")
         lines.append(f"\n{r.get('deep_summary', '')}\n")
         if r.get("suggests_change"):
-            lines.append(f"⚡ **Suggests change:** {r.get('change_description', '')}\n")
+            lines.append(f"**Suggests change:** {r.get('change_description', '')}\n")
 
     lines += ["\n## Phase 4 — Staged Actions\n"]
     for m in manifest:
-        risk_emoji = {"low": "🟢", "medium": "🟡", "high": "🔴"}.get(m["risk"], "⚪")
-        lines.append(f"{risk_emoji} `{m['risk'].upper()}` — {m['title']}")
+        lines.append(f"[{m['risk'].upper()}] {m['title']}")
 
-    lines += [f"\n---\n*Generated by dream_cycle.py at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*"]
-
+    lines += [f"\n---\n*Generated by dream_cycle.py ({agent_name}) at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*"]
     with open(changelog, "w") as f:
         f.write("\n".join(lines))
-
-    log(f"Changelog written: {changelog}")
+    log(f"Changelog: {changelog}")
     return str(changelog)
 
-# ── Send Gmail Summary ─────────────────────────────────────────────────────────
+# ── Send Summary ──────────────────────────────────────────────────────────────
 
-def send_gmail_summary(changelog_path: str, judge: dict, scan: dict):
-    """
-    Sends summary via msmtp or your MCP Gmail server.
-    Requires msmtp configured, or replace with your MCP Gmail call.
-    """
-    subject = f"🌙 Dream Cycle {datetime.now().strftime('%Y-%m-%d')} — {scan.get('priority_track', '?')} | Score {judge.get('tonight_score', '?')}/10"
-    body = judge.get("summary", "No summary generated.")
+def send_gmail_summary(changelog_path: str, judge: dict, scan: dict, agent_name: str):
+    subject = (
+        f"Dream Cycle [{agent_name}] {datetime.now().strftime('%Y-%m-%d')} "
+        f"— {scan.get('priority_track', '?')} | Score {judge.get('tonight_score', '?')}/10"
+    ).replace("\n", " ")
+    body  = judge.get("summary", "No summary generated.")
     body += f"\n\nFull changelog: {changelog_path}"
     body += f"\nStaged actions: {len(judge.get('staged_actions', []))}"
 
-    # Try msmtp first
+    to_addr = os.getenv("DREAM_CYCLE_EMAIL", "")
+    if not to_addr:
+        mail_path = Path(changelog_path).parent / f"{datetime.now().strftime('%Y-%m-%d')}.mail"
+        with open(mail_path, "w") as f:
+            f.write(f"Subject: {subject}\n\n{body}")
+        log(f"No DREAM_CYCLE_EMAIL set — saved to {mail_path}")
+        return
     try:
-        proc = subprocess.run(
-            ["msmtp", "-t"],
-            input=f"To: m.simonson01@gmail.com\nSubject: {subject}\n\n{body}",
-            capture_output=True, text=True, timeout=30
-        )
+        proc = subprocess.run(["msmtp", "-t"],
+                              input=f"To: {to_addr}\nSubject: {subject}\n\n{body}",
+                              capture_output=True, text=True, timeout=30)
         if proc.returncode == 0:
-            log("Gmail sent via msmtp")
+            log("Email sent via msmtp")
             return
     except FileNotFoundError:
         pass
-
-    # Fallback: write to a .mail file for manual pickup
-    mail_path = LOGS_DIR / f"{datetime.now().strftime('%Y-%m-%d')}.mail"
+    mail_path = Path(changelog_path).parent / f"{datetime.now().strftime('%Y-%m-%d')}.mail"
     with open(mail_path, "w") as f:
         f.write(f"Subject: {subject}\n\n{body}")
-    log(f"Gmail not configured — mail saved to {mail_path}")
+    log(f"msmtp not configured — saved to {mail_path}")
 
-# ── Main ───────────────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     global LOCAL_MODEL
 
-    date_str = datetime.now().strftime("%Y-%m-%d")
-    log(f"=== Dream Cycle Starting — {date_str} ===")
+    parser = argparse.ArgumentParser(description="Dream Cycle — nightly research agent")
+    parser.add_argument("--agent",       choices=list(AGENT_PROFILES.keys()),
+                        help="Agent profile to run")
+    parser.add_argument("--reconfigure", action="store_true",
+                        help="Re-run setup for the selected agent")
+    parser.add_argument("--list-agents", action="store_true",
+                        help="List available agent profiles and exit")
+    args = parser.parse_args()
 
-    # Load persisted settings, or prompt once and save
+    if args.list_agents:
+        print("\nAvailable agents:")
+        for name, p in AGENT_PROFILES.items():
+            print(f"  {name:15} — {p['name']}")
+            print(f"               Tracks: {', '.join(p['tracks'][:3])}...")
+        return
+
+    agent_name = args.agent or "ai_research"
+    profile    = AGENT_PROFILES[agent_name]
+    dirs       = get_agent_dirs(agent_name)
+    date_str   = datetime.now().strftime("%Y-%m-%d")
+
+    log(f"=== Dream Cycle [{profile['name']}] — {date_str} ===")
+
     config = load_config()
-    if not config.get("local_model"):
-        config["local_model"] = select_local_model()
-        save_config(config)
-    if "rss_feeds" not in config:
-        config["rss_feeds"] = configure_rss_feeds()
-        save_config(config)
-    LOCAL_MODEL = config["local_model"]
-    rss_feeds = config.get("rss_feeds", [])
-    log(f"Local model: {LOCAL_MODEL} | RSS feeds: {len(rss_feeds)}")
 
-    scan = phase_scan(rss_feeds)
-    reflect = phase_reflect()
-    research = phase_deep_research(scan)
-    judge = phase_judge_and_stage(scan, reflect, research)
-    manifest = write_staging(judge, date_str)
-    changelog_path = write_changelog(date_str, scan, reflect, research, judge, manifest)
-    send_gmail_summary(changelog_path, judge, scan)
+    if not config.get("global", {}).get("local_model"):
+        config.setdefault("global", {})["local_model"] = select_local_model()
+        save_config(config)
+    LOCAL_MODEL = config["global"]["local_model"]
 
-    log(f"=== Dream Cycle Complete. {len(manifest)} actions staged. ===")
+    agent_cfg = get_agent_config(config, agent_name)
+    if not agent_cfg or args.reconfigure:
+        agent_cfg = configure_agent(agent_name, profile)
+        config    = set_agent_config(config, agent_name, agent_cfg)
+        save_config(config)
+
+    log(f"Model: {LOCAL_MODEL} | Repos watched: {len(agent_cfg.get('github_repos', []))}")
+
+    seen_cache = load_seen_cache(dirs["seen_cache"])
+
+    scan     = phase_scan(profile, agent_cfg, seen_cache)
+    save_seen_cache(dirs["seen_cache"], seen_cache)
+
+    reflect  = phase_reflect(profile, dirs)
+    research = phase_deep_research(profile, scan)
+    judge    = phase_judge_and_stage(profile, scan, reflect, research)
+    manifest = write_staging(judge, date_str, dirs)
+    changelog_path = write_changelog(date_str, agent_name, profile,
+                                     scan, reflect, research, judge, manifest, dirs)
+    send_gmail_summary(changelog_path, judge, scan, agent_name)
+
+    log(f"=== Complete. {len(manifest)} actions staged. ===")
 
 if __name__ == "__main__":
     main()
