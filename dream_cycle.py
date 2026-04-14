@@ -1563,6 +1563,114 @@ def audit_dormant_lessons(agent_name: str):
     print()
 
 
+# ── Prompt injection defense ──────────────────────────────────────────────────
+
+# Patterns that look like system-prompt injection attempts.
+# Compiled once; applied to every piece of external content before it enters
+# any LLM prompt (scan items, reflection data, external summaries).
+_INJECTION_PATTERNS: list[re.Pattern] = [
+    # XML / SGML system-role markers
+    re.compile(r"<\s*/?\s*system\s*>",              re.IGNORECASE),
+    re.compile(r"<\s*/?\s*user\s*>",                re.IGNORECASE),
+    re.compile(r"<\s*/?\s*assistant\s*>",           re.IGNORECASE),
+    re.compile(r"<\s*/?\s*instruction\s*>",         re.IGNORECASE),
+    re.compile(r"<\s*/?\s*prompt\s*>",              re.IGNORECASE),
+    re.compile(r"<\s*/?\s*context\s*>",             re.IGNORECASE),
+    # Pipe-delimited chat-template tokens (LLaMA / Mistral / Qwen family)
+    re.compile(r"<\|system\|>",                     re.IGNORECASE),
+    re.compile(r"<\|user\|>",                       re.IGNORECASE),
+    re.compile(r"<\|assistant\|>",                  re.IGNORECASE),
+    re.compile(r"<\|im_start\|>",                   re.IGNORECASE),
+    re.compile(r"<\|im_end\|>",                     re.IGNORECASE),
+    re.compile(r"<\|endoftext\|>",                  re.IGNORECASE),
+    # Bracket-style role markers
+    re.compile(r"\[SYSTEM\]",                       re.IGNORECASE),
+    re.compile(r"\[USER\]",                         re.IGNORECASE),
+    re.compile(r"\[ASSISTANT\]",                    re.IGNORECASE),
+    re.compile(r"\[INST\]",                         re.IGNORECASE),
+    re.compile(r"\[/INST\]",                        re.IGNORECASE),
+    # Common jailbreak preambles (flag for stripping)
+    re.compile(r"ignore\s+(all\s+)?previous\s+instructions?", re.IGNORECASE),
+    re.compile(r"disregard\s+(all\s+)?previous\s+instructions?", re.IGNORECASE),
+    re.compile(r"you\s+are\s+now\s+in\s+DAN\s+mode",            re.IGNORECASE),
+    re.compile(r"act\s+as\s+if\s+you\s+have\s+no\s+restrictions?", re.IGNORECASE),
+]
+
+# 1 token ≈ 4 characters (conservative estimate for most tokenizers).
+_CHARS_PER_TOKEN = 4
+# Hard ceiling: never let a single field exceed this many characters regardless
+# of the configured budget (prevents runaway external content).
+_ABSOLUTE_FIELD_CAP = 2000
+
+
+def sanitize_llm_input(text: str, label: str = "", max_tokens: int = 2000) -> str:
+    """Strip prompt-injection markers and enforce a token-budget character cap.
+
+    Applied to every piece of external content (arXiv titles/summaries, CVE
+    descriptions, GitHub release notes) before it is interpolated into an LLM
+    prompt.  Never raises; returns a safe truncated string on any error.
+
+    Args:
+        text:       The raw external string to sanitize.
+        label:      Human-readable label used in log messages (e.g. "arXiv title").
+        max_tokens: Maximum token budget for this field (default 2000).
+                    Converted to characters via _CHARS_PER_TOKEN.
+
+    Returns:
+        Cleaned, truncated string.
+    """
+    if not isinstance(text, str):
+        return ""
+
+    original_len = len(text)
+    cleaned      = text
+
+    # Strip injection patterns
+    stripped_patterns: list[str] = []
+    for pat in _INJECTION_PATTERNS:
+        if pat.search(cleaned):
+            stripped_patterns.append(pat.pattern[:40])
+            cleaned = pat.sub("", cleaned)
+
+    if stripped_patterns:
+        log(f"  [injection-defense] Stripped pattern(s) from {label or 'input'}: "
+            f"{stripped_patterns}")
+
+    # Enforce character cap (token budget × chars-per-token, capped at absolute max)
+    max_chars = min(max_tokens * _CHARS_PER_TOKEN, _ABSOLUTE_FIELD_CAP * 4)
+    if len(cleaned) > max_chars:
+        log(f"  [injection-defense] Truncated {label or 'input'} "
+            f"{len(cleaned)} → {max_chars} chars")
+        cleaned = cleaned[:max_chars]
+
+    return cleaned.strip()
+
+
+def sanitize_scan_items(items: list[dict], token_budget: int = 2000) -> list[dict]:
+    """Sanitize the text fields of every item in a scan list in-place.
+
+    Fields sanitized: title, summary, link (link is URL-safe-checked separately),
+    description, body.  Returns the mutated list for convenience.
+    """
+    per_field_budget = max(100, token_budget // 4)
+    for item in items:
+        for field in ("title", "summary", "description", "body"):
+            if field in item and isinstance(item[field], str):
+                item[field] = sanitize_llm_input(
+                    item[field],
+                    label=f"item.{field}",
+                    max_tokens=per_field_budget,
+                )
+        # Links: strip any javascript: / data: schemes
+        link = item.get("link", "")
+        if isinstance(link, str):
+            parsed = urlparse(link)
+            if parsed.scheme not in ("http", "https", ""):
+                log(f"  [injection-defense] Stripped unsafe link scheme: {link[:80]}")
+                item["link"] = ""
+    return items
+
+
 # ── Phase 1: Scan ─────────────────────────────────────────────────────────────
 
 def phase_scan(profile: dict, agent_cfg: dict, seen_cache: dict,
@@ -1602,13 +1710,19 @@ def phase_scan(profile: dict, agent_cfg: dict, seen_cache: dict,
     fresh    = filter_seen(all_items, seen_cache)
     filtered = top_k_items(fresh, profile["tracks"])
 
+    # ── Sanitize external content before it enters the LLM prompt ─────────────
+    token_budget = int(profile.get("token_budget", 2000))
+    filtered     = sanitize_scan_items(filtered, token_budget=token_budget)
+    # Hard-cap the serialized items injected into the prompt at budget × 4 chars
+    items_str    = json.dumps(filtered, indent=2)[:token_budget * _CHARS_PER_TOKEN]
+
     prompt = f"""You are the scan phase of a nightly research agent.
 Agent: {profile['name']}
 Context: {profile['context']}
 Tracks: {', '.join(profile['tracks'])}
 
 Tonight's items ({len(filtered)} pre-scored for relevance):
-{json.dumps(filtered, indent=2)[:8000]}
+{items_str}
 
 Tasks:
 1. Score each item 1-10 for relevance to this agent's tracks
@@ -1670,6 +1784,11 @@ def phase_deep_research(profile: dict, scan_results: dict,
     if not findings:
         log("  No findings, skipping Phase 3")
         return {"research": [], "synthesis": ""}
+
+    # Re-sanitize findings coming out of the scan phase before they reach Claude.
+    # The Qwen model could theoretically reproduce injected content in its output.
+    token_budget = int(profile.get("token_budget", 2000))
+    findings     = sanitize_scan_items(list(findings), token_budget=token_budget)
 
     enriched = ollama_enrich_findings(findings, profile)
     priority = scan_results.get("priority_track", "AI/ML")  # noqa: F841
