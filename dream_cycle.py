@@ -31,6 +31,14 @@ try:
 except ImportError:
     CHROMA_AVAILABLE = False
 
+try:
+    import yaml
+    YAML_AVAILABLE = True
+except ImportError:
+    YAML_AVAILABLE = False
+
+import random
+
 # ── Paths ─────────────────────────────────────────────────────────────────────
 BASE_DIR    = Path.home() / "dream-cycle"
 LOGS_DIR    = Path.home() / "dream-logs"
@@ -176,6 +184,20 @@ def save_config(config: dict):
     with open(CONFIG_FILE, "w") as f:
         json.dump(config, f, indent=2)
 
+# config.yaml lives next to this script and carries defaults for new features.
+YAML_CONFIG_FILE = Path(__file__).parent / "config.yaml"
+
+def load_yaml_config() -> dict:
+    """Load extended config from config.yaml; returns {} if pyyaml is absent."""
+    if not YAML_AVAILABLE or not YAML_CONFIG_FILE.exists():
+        return {}
+    try:
+        with open(YAML_CONFIG_FILE) as f:
+            return yaml.safe_load(f) or {}
+    except Exception as e:
+        log(f"config.yaml load error: {e}")
+        return {}
+
 def get_agent_config(config: dict, agent_name: str) -> dict:
     return config.get("agents", {}).get(agent_name, {})
 
@@ -202,43 +224,6 @@ def get_agent_dirs(agent_name: str) -> dict:
     }
 
 # ── Model selection ───────────────────────────────────────────────────────────
-
-def list_ollama_models() -> list[str]:
-# ── Paths ──────────────────────────────────────────────────────────────────────
-BASE_DIR = Path.home() / "dream-cycle"
-STAGING_DIR = BASE_DIR / "dream-staging"
-APPLIED_DIR = STAGING_DIR / "applied"
-LOGS_DIR = Path.home() / "dream-logs"
-PERF_LOG = BASE_DIR / "performance.jsonl"
-CONFIG_FILE = BASE_DIR / "config.json"
-
-for d in [STAGING_DIR, APPLIED_DIR, LOGS_DIR]:
-    d.mkdir(parents=True, exist_ok=True)
-
-# ── Models ─────────────────────────────────────────────────────────────────────
-LOCAL_MODEL = ""                    # set at runtime from config or interactive selection
-CLAUDE_MODEL = "claude-sonnet-4-6"  # Anthropic — deep research + judge
-
-TRACKS = ["AI/ML", "Cybersecurity", "Robotics/CV", "Data Analytics", "Project Management"]
-
-client = anthropic.Anthropic()
-
-# ── Config ─────────────────────────────────────────────────────────────────────
-
-def load_config() -> dict:
-    if CONFIG_FILE.exists():
-        try:
-            with open(CONFIG_FILE) as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {}
-
-def save_config(config: dict):
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(config, f, indent=2)
-
-# ── Model selection ────────────────────────────────────────────────────────────
 
 def list_ollama_models() -> list[str]:
     try:
@@ -439,15 +424,69 @@ def fetch_arxiv(query: str, max_results: int = 10) -> list[dict]:
                                     "sortBy": "submittedDate"}, timeout=30)
         root = ET.fromstring(r.text)
         ns   = {"atom": "http://www.w3.org/2005/Atom"}
-        return [{
-            "title":   entry.find("atom:title",   ns).text.strip(),
-            "summary": entry.find("atom:summary", ns).text.strip()[:500],
-            "link":    entry.find("atom:id",      ns).text.strip(),
-            "source":  "arxiv",
-        } for entry in root.findall("atom:entry", ns)]
+        results = []
+        for entry in root.findall("atom:entry", ns):
+            id_text  = entry.find("atom:id", ns).text.strip()
+            arxiv_id = id_text.split("/abs/")[-1] if "/abs/" in id_text else id_text
+            authors  = [
+                a.find("atom:name", ns).text.strip()
+                for a in entry.findall("atom:author", ns)
+            ]
+            results.append({
+                "title":    entry.find("atom:title",   ns).text.strip(),
+                "summary":  entry.find("atom:summary", ns).text.strip()[:500],
+                "link":     id_text,
+                "arxiv_id": arxiv_id,
+                "authors":  authors[:5],   # cap at 5 to keep payload lean
+                "source":   "arxiv",
+            })
+        return results
     except Exception as e:
         log(f"arXiv error: {e}")
         return []
+
+
+def _arxiv_cache_path(agent_dir: Path, date_str: str, tag: str) -> Path:
+    cache_dir = agent_dir / "arxiv_cache"
+    cache_dir.mkdir(exist_ok=True)
+    return cache_dir / f"{date_str}_{tag.replace('.', '_')}.json"
+
+
+def fetch_arxiv_by_categories(
+    tags: list[str],
+    results_per_tag: int,
+    agent_dir: Path,
+    date_str: str,
+) -> list[dict]:
+    """Fetch top papers per arXiv category tag with date-scoped caching.
+
+    Called from phase_scan() (Qwen / local model phase).  Results are cached
+    in <agent_dir>/arxiv_cache/<date>_<tag>.json so repeated runs on the same
+    calendar day don't re-hit the API.
+    """
+    all_items: list[dict] = []
+    for tag in tags:
+        cache_path = _arxiv_cache_path(agent_dir, date_str, tag)
+        if cache_path.exists():
+            try:
+                with open(cache_path) as f:
+                    items = json.load(f)
+                log(f"  arXiv cache hit: {tag} ({len(items)} papers)")
+                all_items.extend(items)
+                continue
+            except Exception:
+                pass
+        items = fetch_arxiv(f"cat:{tag}", results_per_tag)
+        for item in items:
+            item["category_tag"] = tag
+        try:
+            with open(cache_path, "w") as f:
+                json.dump(items, f)
+        except Exception:
+            pass
+        log(f"  arXiv fetched: {tag} → {len(items)} papers")
+        all_items.extend(items)
+    return all_items
 
 def fetch_github_trending() -> list[dict]:
     try:
@@ -630,14 +669,76 @@ def ucb1_score(times_selected: int, cumulative_value: float,
     return mean + C * math.sqrt(math.log(total_runs) / times_selected)
 
 
+def _bridge_parent(
+    agent_name: str,
+    C: float,
+    exclude_ids: set[str],
+) -> dict | None:
+    """Return the highest-UCB1 run node from a *different* agent (cross-domain bridge).
+
+    Returns None when no cross-domain nodes exist or ChromaDB is unavailable.
+    The returned dict has an extra 'bridge_domain' key with the source agent name.
+    """
+    chroma = get_chroma_client()
+    if chroma is None:
+        return None
+    coll = _run_nodes(chroma)
+    try:
+        all_nodes = coll.get(include=["documents", "metadatas"])
+    except Exception:
+        return None
+
+    ids   = all_nodes.get("ids", [])
+    docs  = all_nodes.get("documents", [])
+    metas = all_nodes.get("metadatas", [])
+    if not ids:
+        return None
+
+    total      = len(ids)
+    best_score = -float("inf")
+    best_entry = None
+
+    for rid, doc, meta in zip(ids, docs, metas):
+        if meta.get("agent_name") == agent_name:
+            continue          # same domain — skip
+        if rid in exclude_ids:
+            continue          # already selected
+        score = ucb1_score(
+            int(meta.get("times_selected", 0)),
+            float(meta.get("cumulative_value", 0.0)),
+            total, C,
+        )
+        if score > best_score:
+            best_score = score
+            best_entry = (rid, doc, meta)
+
+    if best_entry is None:
+        return None
+
+    rid, doc, meta = best_entry
+    return {
+        "run_id":         rid,
+        "date_str":       meta.get("date_str", ""),
+        "priority_track": meta.get("priority_track", ""),
+        "tonight_score":  int(meta.get("tonight_score", 0)),
+        "summary":        doc,
+        "bridge_domain":  meta.get("agent_name", ""),
+    }
+
+
 def select_context_parents(agent_name: str, k: int = 3,
                            disable_ucb1: bool = False,
-                           C: float = UCB1_C_DEFAULT) -> list[dict]:
+                           C: float = UCB1_C_DEFAULT,
+                           bridge_probability: float = 0.0) -> list[dict]:
     """Score all past run nodes for *agent_name* via UCB1 and return the top-k.
 
     Each returned dict has: run_id, date_str, priority_track, tonight_score, summary.
     Falls back to chronological (most-recent-first) when --disable-ucb1 is set or
     when ChromaDB is unavailable.  Increments times_selected for chosen nodes.
+
+    When bridge_probability > 0 (and UCB1 is active), one parent slot is
+    replaced with the highest-UCB1 node from a different agent domain.
+    Bridge events are logged with the domain pair (Feature 4).
     """
     chroma = get_chroma_client()
     if chroma is None:
@@ -697,6 +798,30 @@ def select_context_parents(agent_name: str, k: int = 3,
     if parents:
         mode = "sequential" if disable_ucb1 else "UCB1"
         log(f"Context parents ({mode}): {[p['run_id'] for p in parents]}")
+
+    # ── Cross-domain bridge (Feature 4) ──────────────────────────────────────
+    if (not disable_ucb1 and bridge_probability > 0.0
+            and random.random() < bridge_probability and parents):
+        bridge = _bridge_parent(agent_name, C, set(selected_ids))
+        if bridge:
+            replaced = parents.pop()   # drop lowest-scored same-domain parent
+            parents.append(bridge)
+            log(f"Bridge: {agent_name} ← {bridge['bridge_domain']}"
+                f"  [run={bridge['run_id']}, track={bridge['priority_track']}]"
+                f"  (replaced {replaced['run_id']})")
+            # Track selection for bridge node
+            b_chroma = get_chroma_client()
+            if b_chroma:
+                b_coll = _run_nodes(b_chroma)
+                b_ex   = b_coll.get(ids=[bridge["run_id"]], include=["metadatas"])
+                if b_ex["ids"]:
+                    bm = b_ex["metadatas"][0]
+                    b_coll.update(
+                        ids=[bridge["run_id"]],
+                        metadatas=[{**bm,
+                                    "times_selected": int(bm.get("times_selected", 0)) + 1}],
+                    )
+
     return parents
 
 
@@ -763,27 +888,296 @@ def store_lessons(lessons: list[dict], agent_name: str, run_id: str):
         tags = lesson.get("tags", [])
         ids.append(f"{agent_name}_{run_id}_{i}")
         documents.append(text)
+        confidence = float(lesson.get("confidence", 0.5))
         metadatas.append({
-            "domain":        str(lesson.get("domain", "")),
-            "confidence":    float(lesson.get("confidence", 0.5)),
-            "source_run_id": str(lesson.get("source_run_id", run_id)),
-            "tags":          ",".join(tags) if isinstance(tags, list) else str(tags),
-            "agent_name":    agent_name,
+            "domain":                str(lesson.get("domain", "")),
+            "confidence":            confidence,
+            "source_run_id":         str(lesson.get("source_run_id", run_id)),
+            "tags":                  ",".join(tags) if isinstance(tags, list) else str(tags),
+            "agent_name":            agent_name,
+            # ── contradiction metadata (Feature 2) ────────────────────────
+            "contradiction":         bool(lesson.get("contradiction", False)),
+            "conflicting_lesson_id": str(lesson.get("conflicting_lesson_id") or ""),
+            "recommendation":        str(lesson.get("recommendation", "coexist")),
+            # ── decay fields (Feature 3) ──────────────────────────────────
+            "confidence_decay":      confidence,   # starts equal to base confidence
+            "selection_count":       0,
+            "last_selected_run":     "",
+            "dormant":               False,
+            "superseded":            False,
         })
     if ids:
         coll.upsert(ids=ids, documents=documents, metadatas=metadatas)
         log(f"Stored {len(ids)} lesson(s) in lesson_corpus")
 
 
+# ── Contradiction Detection (Feature 2) ──────────────────────────────────────
+
+def detect_contradictions(
+    new_lessons: list[dict],
+    agent_name: str,
+    priority_track: str,
+) -> list[dict]:
+    """Check new candidate lessons against the existing corpus for contradictions.
+
+    Uses Claude Sonnet (per spec: Sonnet handles contradiction detection).
+    Attaches contradiction metadata to each lesson dict in-place and returns
+    the annotated list.  Safe to call when ChromaDB is unavailable — returns
+    the list unchanged.
+    """
+    if not new_lessons:
+        return new_lessons
+    chroma = get_chroma_client()
+    if chroma is None:
+        return new_lessons
+    coll = _lesson_corpus(chroma)
+    try:
+        existing = coll.get(
+            where={"agent_name": agent_name},
+            include=["documents", "metadatas"],
+        )
+    except Exception as exc:
+        log(f"Contradiction check: corpus query failed — {exc}")
+        return new_lessons
+
+    existing_ids  = existing.get("ids", [])
+    existing_docs = existing.get("documents", [])
+    existing_meta = existing.get("metadatas", [])
+
+    # Only compare against active (non-dormant, non-superseded) lessons
+    active = [
+        {"id": eid, "lesson": doc,
+         "domain": meta.get("domain", ""),
+         "confidence": meta.get("confidence", 0.5)}
+        for eid, doc, meta in zip(existing_ids, existing_docs, existing_meta)
+        if not meta.get("dormant") and not meta.get("superseded")
+    ]
+    if not active:
+        return new_lessons
+
+    candidates = [
+        {"index": i, "lesson": l.get("lesson", ""), "domain": l.get("domain", "")}
+        for i, l in enumerate(new_lessons)
+    ]
+
+    prompt = f"""You are a knowledge-consistency checker for a nightly AI research agent.
+
+Current run domain context: {priority_track}
+Agent: {agent_name}
+
+Existing active lessons (from prior runs):
+{json.dumps(active[:60], indent=2)[:3000]}
+
+New candidate lessons to evaluate:
+{json.dumps(candidates, indent=2)}
+
+For each candidate, check whether it directly contradicts any existing lesson.
+A contradiction means the two lessons give incompatible guidance on the same topic.
+
+Return a JSON array — one entry per candidate, preserving index order:
+[
+  {{
+    "candidate_index": 0,
+    "contradiction": false,
+    "conflicting_lesson_id": null,
+    "description": "",
+    "recommendation": "coexist"
+  }}
+]
+recommendation must be exactly one of:
+  "supersede" — new lesson is a better/updated version; mark old lesson superseded
+  "coexist"   — no real conflict; keep both
+  "discard"   — existing lesson is stronger; lower confidence on the new one
+"""
+
+    raw = claude_chat(prompt)
+    try:
+        start = raw.find("[")
+        end   = raw.rfind("]")
+        flags = json.loads(raw[start:end + 1]) if start != -1 and end != -1 else []
+    except Exception:
+        log("Contradiction detection parse failed — skipping")
+        return new_lessons
+
+    flag_map = {f.get("candidate_index", i): f for i, f in enumerate(flags)}
+    for i, lesson in enumerate(new_lessons):
+        flag = flag_map.get(i, {})
+        if flag.get("contradiction"):
+            rec = flag.get("recommendation", "coexist")
+            lesson["contradiction"]         = True
+            lesson["conflicting_lesson_id"] = flag.get("conflicting_lesson_id")
+            lesson["contradiction_desc"]    = flag.get("description", "")
+            lesson["recommendation"]        = rec
+            if rec == "discard":
+                lesson["confidence"] = round(float(lesson.get("confidence", 0.5)) * 0.5, 4)
+            log(f"  Contradiction [{rec}]: {lesson.get('lesson', '')[:70]}…")
+        else:
+            lesson.setdefault("contradiction", False)
+            lesson.setdefault("recommendation", "coexist")
+    return new_lessons
+
+
+def mark_lesson_superseded(lesson_id: str):
+    """Flag an existing lesson as superseded.
+
+    The lesson is kept in the corpus but excluded from active retrieval.
+    Called when contradiction detection returns recommendation='supersede'.
+    """
+    chroma = get_chroma_client()
+    if chroma is None:
+        return
+    coll = _lesson_corpus(chroma)
+    try:
+        existing = coll.get(ids=[lesson_id], include=["metadatas"])
+        if not existing["ids"]:
+            log(f"  mark_lesson_superseded: id '{lesson_id}' not found")
+            return
+        meta = existing["metadatas"][0]
+        coll.update(ids=[lesson_id], metadatas=[{**meta, "superseded": True}])
+        log(f"  Lesson {lesson_id} marked superseded")
+    except Exception as exc:
+        log(f"  mark_lesson_superseded failed: {exc}")
+
+
+# ── Lesson Decay (Feature 3) ──────────────────────────────────────────────────
+
+def apply_lesson_decay(
+    agent_name: str,
+    selected_run_ids: list[str],
+    current_run_id: str,
+    decay_factor: float = 0.98,
+    dormant_threshold: float = 0.15,
+):
+    """Post-run cleanup: decay confidence for lessons whose parent run was NOT selected.
+
+    Called after the run completes — not inline with phases.
+    Lessons whose decayed confidence drops below *dormant_threshold* are flagged
+    dormant (excluded from active retrieval, retained in corpus).
+    Lessons whose parent run WAS selected get their selection_count incremented.
+    """
+    chroma = get_chroma_client()
+    if chroma is None:
+        return
+    coll = _lesson_corpus(chroma)
+    try:
+        results = coll.get(
+            where={"agent_name": agent_name},
+            include=["documents", "metadatas"],
+        )
+    except Exception as exc:
+        log(f"Lesson decay: corpus query failed — {exc}")
+        return
+
+    ids   = results.get("ids", [])
+    metas = results.get("metadatas", [])
+    if not ids:
+        return
+
+    selected_set  = set(selected_run_ids) | {current_run_id}
+    decayed_ids   = []
+    decayed_metas = []
+    dormant_count = 0
+
+    for lid, meta in zip(ids, metas):
+        if meta.get("superseded") or meta.get("dormant"):
+            continue  # already inactive — skip
+        src = meta.get("source_run_id", "")
+        if src in selected_set:
+            # Parent run was selected → refresh selection tracking
+            coll.update(
+                ids=[lid],
+                metadatas=[{**meta,
+                            "selection_count":   int(meta.get("selection_count", 0)) + 1,
+                            "last_selected_run": current_run_id}],
+            )
+            continue
+        # Parent run not selected → apply decay
+        cur_conf = float(meta.get("confidence_decay", meta.get("confidence", 0.5)))
+        new_conf = round(cur_conf * decay_factor, 6)
+        new_meta = {**meta, "confidence_decay": new_conf}
+        if new_conf < dormant_threshold:
+            new_meta["dormant"] = True
+            dormant_count += 1
+        decayed_ids.append(lid)
+        decayed_metas.append(new_meta)
+
+    if decayed_ids:
+        # Batch ChromaDB updates in chunks of 100
+        for i in range(0, len(decayed_ids), 100):
+            coll.update(
+                ids=decayed_ids[i:i + 100],
+                metadatas=decayed_metas[i:i + 100],
+            )
+        msg = f"Lesson decay: {len(decayed_ids)} lesson(s) decayed"
+        if dormant_count:
+            msg += f", {dormant_count} newly dormant"
+        log(msg)
+
+
+def audit_dormant_lessons(agent_name: str):
+    """Print a review table of dormant lessons for *agent_name*.
+
+    Invoked via: dream_cycle.py --audit-dormant [--agent NAME]
+    """
+    chroma = get_chroma_client()
+    if chroma is None:
+        print("ChromaDB unavailable — cannot audit dormant lessons")
+        return
+    coll = _lesson_corpus(chroma)
+    try:
+        results = coll.get(
+            where={"agent_name": agent_name, "dormant": True},
+            include=["documents", "metadatas"],
+        )
+    except Exception as exc:
+        print(f"Audit failed: {exc}")
+        return
+
+    ids   = results.get("ids", [])
+    docs  = results.get("documents", [])
+    metas = results.get("metadatas", [])
+    if not ids:
+        print(f"No dormant lessons found for agent '{agent_name}'.")
+        return
+
+    print(f"\n{'─'*70}")
+    print(f"  Dormant Lessons — {agent_name}  ({len(ids)} total)")
+    print(f"{'─'*70}")
+    for lid, doc, meta in zip(ids, docs, metas):
+        status = "SUPERSEDED" if meta.get("superseded") else "dormant"
+        print(f"\n  ID:        {lid}")
+        print(f"  Lesson:    {doc[:110]}")
+        print(f"  Domain:    {meta.get('domain', '?')}")
+        print(f"  Decay:     {meta.get('confidence_decay', '?'):.4f}"
+              f"  (orig {meta.get('confidence', '?'):.2f})")
+        print(f"  Selected:  {meta.get('selection_count', 0)}×"
+              f"  last={meta.get('last_selected_run', 'never')}")
+        print(f"  Status:    {status}")
+    print()
+
+
 # ── Phase 1: Scan ─────────────────────────────────────────────────────────────
 
-def phase_scan(profile: dict, agent_cfg: dict, seen_cache: dict) -> dict:
+def phase_scan(profile: dict, agent_cfg: dict, seen_cache: dict,
+               dirs: dict | None = None, date_str: str = "",
+               yaml_cfg: dict | None = None) -> dict:
     log("Phase 1: Scanning sources...")
 
     all_items: list[dict] = []
 
+    # Per-agent keyword queries (existing behaviour)
     for query, n in profile["arxiv_queries"]:
         all_items.extend(fetch_arxiv(query, n))
+
+    # Category-tag scan — Qwen phase, cached per day (Feature 1)
+    if dirs and date_str:
+        arxiv_cfg    = (yaml_cfg or {}).get("arxiv", {})
+        cat_tags     = arxiv_cfg.get("category_tags", ["cs.AI", "cs.LG", "cs.MA"])
+        per_tag      = int(arxiv_cfg.get("results_per_tag", 5))
+        cat_items    = fetch_arxiv_by_categories(
+                           cat_tags, per_tag, dirs["agent_dir"], date_str)
+        log(f"  arXiv categories ({', '.join(cat_tags)}): {len(cat_items)} papers")
+        all_items.extend(cat_items)
 
     if profile.get("fetch_github_trending"):
         all_items.extend(fetch_github_trending())
@@ -1127,6 +1521,8 @@ def main():
                         help="List available agent profiles and exit")
     parser.add_argument("--disable-ucb1", action="store_true",
                         help="Fall back to sequential (most-recent-first) context-parent selection")
+    parser.add_argument("--audit-dormant", action="store_true",
+                        help="Review dormant lessons for the selected agent and exit")
     args = parser.parse_args()
 
     if args.list_agents:
@@ -1142,9 +1538,15 @@ def main():
     date_str   = datetime.now().strftime("%Y-%m-%d")
     run_id     = f"{agent_name}_{date_str}_{datetime.now().strftime('%H%M%S')}"
 
+    # --audit-dormant: review dormant lessons and exit (no run needed)
+    if args.audit_dormant:
+        audit_dormant_lessons(agent_name)
+        return
+
     log(f"=== Dream Cycle [{profile['name']}] — {date_str} (run={run_id}) ===")
 
-    config = load_config()
+    config   = load_config()
+    yaml_cfg = load_yaml_config()
 
     if not config.get("global", {}).get("local_model"):
         config.setdefault("global", {})["local_model"] = select_local_model()
@@ -1157,9 +1559,13 @@ def main():
         config    = set_agent_config(config, agent_name, agent_cfg)
         save_config(config)
 
-    ucb1_c = float(config.get("global", {}).get("ucb1_c", UCB1_C_DEFAULT))
+    ucb1_c      = float(config.get("global", {}).get("ucb1_c", UCB1_C_DEFAULT))
+    bridge_prob = float(
+        yaml_cfg.get("cross_domain_bridge", {}).get("bridge_probability", 0.20)
+    )
     log(f"Model: {LOCAL_MODEL} | Repos watched: {len(agent_cfg.get('github_repos', []))} "
-        f"| UCB1 C={ucb1_c}{' (disabled)' if args.disable_ucb1 else ''}")
+        f"| UCB1 C={ucb1_c}{' (disabled)' if args.disable_ucb1 else ''}"
+        f" | bridge_p={bridge_prob}")
 
     seen_cache = load_seen_cache(dirs["seen_cache"])
 
@@ -1167,27 +1573,53 @@ def main():
     register_run_node(run_id, agent_name, date_str)
 
     # UCB1 context-parent selection (or sequential fallback with --disable-ucb1)
+    # bridge_probability injects one cross-domain parent slot (Feature 4)
     parents = select_context_parents(agent_name, k=3,
-                                     disable_ucb1=args.disable_ucb1, C=ucb1_c)
+                                     disable_ucb1=args.disable_ucb1, C=ucb1_c,
+                                     bridge_probability=bridge_prob)
     parent_context = "\n".join(
         f"[{p['date_str']} score={p['tonight_score']}/10 "
-        f"track={p['priority_track']}]: {p['summary']}"
+        f"track={p['priority_track']}"
+        + (f" bridge_from={p['bridge_domain']}" if p.get("bridge_domain") else "")
+        + f"]: {p['summary']}"
         for p in parents
     )
 
-    scan     = phase_scan(profile, agent_cfg, seen_cache)
+    # Phase 1: Scan (Qwen) — now includes arXiv category fetch with date cache
+    scan = phase_scan(profile, agent_cfg, seen_cache,
+                      dirs=dirs, date_str=date_str, yaml_cfg=yaml_cfg)
     save_seen_cache(dirs["seen_cache"], seen_cache)
 
     reflect  = phase_reflect(profile, dirs)
     research = phase_deep_research(profile, scan, parent_context)
     judge    = phase_judge_and_stage(profile, scan, reflect, research)
 
-    # Lesson extraction (Claude/Sonnet) → lesson_corpus ChromaDB collection
-    lessons  = phase_extract_lessons(judge, run_id, agent_name)
+    # Phase 5: Lesson extraction (Claude/Sonnet)
+    lessons = phase_extract_lessons(judge, run_id, agent_name)
+
+    # Contradiction detection (Sonnet) — before storage (Feature 2)
+    if yaml_cfg.get("contradiction_detection", {}).get("enabled", True):
+        lessons = detect_contradictions(
+            lessons, agent_name, scan.get("priority_track", ""))
+        for lesson in lessons:
+            if lesson.get("recommendation") == "supersede":
+                cid = lesson.get("conflicting_lesson_id")
+                if cid:
+                    mark_lesson_superseded(cid)
+
     store_lessons(lessons, agent_name, run_id)
 
     # Persist final score and summary; cumulative_value accumulates for UCB1
     update_run_node(run_id, judge.get("tonight_score", 0), judge.get("summary", ""))
+
+    # Post-run lesson decay cleanup — not inline with phases (Feature 3)
+    selected_run_ids = [p["run_id"] for p in parents]
+    decay_cfg        = yaml_cfg.get("lesson_decay", {})
+    apply_lesson_decay(
+        agent_name, selected_run_ids, run_id,
+        decay_factor      = float(decay_cfg.get("decay_factor",       0.98)),
+        dormant_threshold = float(decay_cfg.get("dormant_threshold",  0.15)),
+    )
 
     manifest = write_staging(judge, date_str, dirs)
     changelog_path = write_changelog(date_str, agent_name, profile,
@@ -1195,26 +1627,5 @@ def main():
     send_gmail_summary(changelog_path, judge, scan, agent_name)
 
     log(f"=== Complete. {len(manifest)} actions staged. ===")
-    date_str = datetime.now().strftime("%Y-%m-%d")
-    log(f"=== Dream Cycle Starting — {date_str} ===")
-
-    # Load persisted model, or prompt once and save it
-    config = load_config()
-    if not config.get("local_model"):
-        config["local_model"] = select_local_model()
-        save_config(config)
-    LOCAL_MODEL = config["local_model"]
-    log(f"Local model: {LOCAL_MODEL}")
-
-    scan = phase_scan()
-    reflect = phase_reflect()
-    research = phase_deep_research(scan)
-    judge = phase_judge_and_stage(scan, reflect, research)
-    manifest = write_staging(judge, date_str)
-    changelog_path = write_changelog(date_str, scan, reflect, research, judge, manifest)
-    send_gmail_summary(changelog_path, judge, scan)
-
-    log(f"=== Dream Cycle Complete. {len(manifest)} actions staged. ===")
-
 if __name__ == "__main__":
     main()

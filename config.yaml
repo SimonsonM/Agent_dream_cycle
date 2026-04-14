@@ -1,0 +1,52 @@
+# Dream Cycle — extended feature configuration
+# These are the documented defaults.  Override any value here; the file is
+# read at startup alongside ~/dream-cycle/config.json (which holds runtime
+# state: model selection, watched repos, UCB1 C).
+
+# ── Feature 1: Arxiv Category Scan ──────────────────────────────────────────
+# Scanned every run by the Qwen (local) scan phase.
+# Results are cached per-tag per calendar day under
+#   ~/dream-cycle/<agent>/arxiv_cache/<YYYY-MM-DD>_<TAG>.json
+# so repeated runs on the same day don't re-hit the API.
+#
+# Valid category tags: https://arxiv.org/category_taxonomy
+arxiv:
+  category_tags:
+    - cs.AI
+    - cs.LG
+    - cs.MA
+  # Papers fetched per category tag per run (before dedup filtering).
+  results_per_tag: 5
+
+# ── Feature 2: Contradiction Detection ──────────────────────────────────────
+# Runs after Phase 5 (lesson extraction), before lessons are stored.
+# Claude Sonnet queries the lesson_corpus for existing lessons in the same
+# agent domain and identifies direct contradictions with the new candidates.
+# Supported recommendations: "supersede" | "coexist" | "discard"
+#   supersede → old lesson is flagged superseded (kept, excluded from retrieval)
+#   coexist   → both lessons are stored normally
+#   discard   → new lesson is stored with a low-confidence flag
+contradiction_detection:
+  enabled: true
+
+# ── Feature 3: Lesson Decay ──────────────────────────────────────────────────
+# Applied as a post-run cleanup step (not inline with phases).
+# Every lesson whose source run was NOT selected as a context parent has its
+# confidence_decay field multiplied by decay_factor.
+# Lessons that drop below dormant_threshold are flagged dormant — excluded
+# from active retrieval but retained in the corpus for audit.
+# Use:  dream_cycle.py --audit-dormant [--agent NAME]
+lesson_decay:
+  # Multiplicative factor per unselected run (~2 % drop per night).
+  decay_factor: 0.98
+  # Lessons below this decayed confidence are flagged dormant.
+  dormant_threshold: 0.15
+
+# ── Feature 4: Cross-Domain Bridging ────────────────────────────────────────
+# Applied inside the UCB1 parent-selection step.
+# With probability bridge_probability, one parent slot is replaced by the
+# highest-UCB1 run node from a *different* agent (different domain).
+# Bridge events are logged with the domain pair for later review.
+# Set bridge_probability: 0.0 to disable.
+cross_domain_bridge:
+  bridge_probability: 0.20
