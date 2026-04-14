@@ -1,0 +1,13 @@
+{
+  "id": "example_agent",
+  "name": "Example Research Agent",
+  "version": "1.0.0",
+  "type": "research",
+  "memory_namespace": "example",
+  "scan_targets": [
+    "arxiv",
+    "github_trending"
+  ],
+  "active": false,
+  "mcp_endpoint": "http://localhost:8765"
+}

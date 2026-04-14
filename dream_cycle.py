@@ -37,6 +37,7 @@ try:
 except ImportError:
     YAML_AVAILABLE = False
 
+import platform
 import random
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
@@ -204,6 +205,138 @@ def get_agent_config(config: dict, agent_name: str) -> dict:
 def set_agent_config(config: dict, agent_name: str, agent_cfg: dict) -> dict:
     config.setdefault("agents", {})[agent_name] = agent_cfg
     return config
+
+# ── Manifest-based agent registry ─────────────────────────────────────────────
+
+# Fields every manifest must provide (active agents only).
+MANIFEST_REQUIRED_FIELDS = {"id", "name", "version", "type", "memory_namespace",
+                             "scan_targets", "active"}
+
+# Agent types that map to an existing built-in profile for default scanning config.
+_MANIFEST_TYPE_TO_BUILTIN = {
+    "security":    "security",
+    "marketing":   "marketing",
+    "programming": "programming",
+    "research":    "ai_research",
+}
+
+
+def get_agent_manifest_dirs() -> list[Path]:
+    """Return all valid manifest directories for the current platform.
+
+    Linux  : ~/.dream_cycle/agents/
+    macOS  : ~/.dream_cycle/agents/
+             ~/Library/Application Support/dream_cycle/agents/
+    Windows: %APPDATA%/dream_cycle/agents/
+             HKCU\\Software\\DreamCycle\\Agents registry keys (if winreg available)
+
+    Only directories that currently exist on disk are returned.
+    pathlib.Path is used throughout — no hardcoded separators.
+    """
+    system = platform.system()
+    candidates: list[Path] = []
+
+    # Common to all platforms
+    candidates.append(Path.home() / ".dream_cycle" / "agents")
+
+    if system == "Darwin":
+        candidates.append(
+            Path.home() / "Library" / "Application Support" / "dream_cycle" / "agents"
+        )
+    elif system == "Windows":
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            candidates.append(Path(appdata) / "dream_cycle" / "agents")
+        # Optional: scan HKCU\Software\DreamCycle\Agents for extra paths
+        try:
+            import winreg  # type: ignore[import]
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                 r"Software\DreamCycle\Agents")
+            i = 0
+            while True:
+                try:
+                    _name, value, _type = winreg.EnumValue(key, i)
+                    candidates.append(Path(value))
+                    i += 1
+                except OSError:
+                    break
+            winreg.CloseKey(key)
+        except Exception:
+            pass  # winreg unavailable or key absent — silent fallback
+
+    return [d for d in candidates if d.is_dir()]
+
+
+def load_agent_manifests() -> dict:
+    """Scan all platform manifest dirs and build a registry of active agents.
+
+    Returns a dict keyed by agent id.  Invalid manifests (missing fields,
+    JSON errors, inactive) are silently skipped with a log message.
+    Duplicate IDs: first encountered wins.
+    """
+    registry: dict[str, dict] = {}
+    dirs = get_agent_manifest_dirs()
+    if not dirs:
+        return registry
+
+    log(f"Scanning {len(dirs)} manifest dir(s): {[str(d) for d in dirs]}")
+    for manifest_dir in dirs:
+        for manifest_file in sorted(manifest_dir.glob("*.json")):
+            try:
+                with open(manifest_file) as f:
+                    manifest = json.load(f)
+            except Exception as exc:
+                log(f"  Manifest parse error ({manifest_file.name}): {exc}")
+                continue
+
+            missing = MANIFEST_REQUIRED_FIELDS - set(manifest.keys())
+            if missing:
+                log(f"  Skipping {manifest_file.name}: missing fields {missing}")
+                continue
+            if not manifest.get("active", False):
+                log(f"  Skipping {manifest_file.name}: inactive")
+                continue
+
+            agent_id = str(manifest["id"])
+            if agent_id in registry:
+                log(f"  Duplicate id '{agent_id}' in {manifest_file.name} — skipped")
+                continue
+
+            registry[agent_id] = manifest
+            log(f"  Registered manifest agent: {agent_id} ({manifest['name']})")
+
+    return registry
+
+
+def manifest_to_profile(manifest: dict) -> dict:
+    """Convert a manifest dict to an AGENT_PROFILES-compatible profile dict.
+
+    The manifest's *type* selects the closest built-in profile as a base for
+    scan configuration (arxiv queries, GitHub trending, CVE toggle, etc.).
+    Manifest-specific fields (memory_namespace, mcp_endpoint, scan_targets)
+    are preserved as extra keys so the rest of the cycle can use them.
+    scan_targets overrides the fetch_* booleans from the base profile.
+    """
+    base_key = _MANIFEST_TYPE_TO_BUILTIN.get(manifest.get("type", ""), "ai_research")
+    base = dict(AGENT_PROFILES[base_key])
+
+    scan_targets: list[str] = manifest.get("scan_targets", [])
+    # Resolve any tilde/env-var paths in scan_targets at runtime
+    resolved_targets = [
+        str(Path(t).expanduser()) if t.startswith("~") else t
+        for t in scan_targets
+    ]
+
+    return {
+        **base,
+        "name":             manifest["name"],
+        "memory_namespace": manifest["memory_namespace"],
+        "mcp_endpoint":     manifest.get("mcp_endpoint", ""),
+        "scan_targets":     resolved_targets,
+        "fetch_cves":           "cves" in scan_targets,
+        "fetch_github_trending": "github_trending" in scan_targets,
+        "_from_manifest":   True,
+    }
 
 # ── Per-agent directories ─────────────────────────────────────────────────────
 
@@ -1512,9 +1645,24 @@ def send_gmail_summary(changelog_path: str, judge: dict, scan: dict, agent_name:
 def main():
     global LOCAL_MODEL
 
+    # ── Build combined profile registry ───────────────────────────────────────
+    # Load manifest agents first so they can extend (but not silently replace)
+    # the built-in profiles.  Manifest ids that collide with built-in names are
+    # logged and skipped to avoid surprising behavior.
+    manifest_registry = load_agent_manifests()
+    manifest_profiles: dict[str, dict] = {}
+    for agent_id, manifest in manifest_registry.items():
+        if agent_id in AGENT_PROFILES:
+            log(f"Manifest id '{agent_id}' shadows a built-in profile — skipped. "
+                f"Rename the manifest id to avoid collision.")
+            continue
+        manifest_profiles[agent_id] = manifest_to_profile(manifest)
+
+    all_profiles: dict[str, dict] = {**AGENT_PROFILES, **manifest_profiles}
+
     parser = argparse.ArgumentParser(description="Dream Cycle — nightly research agent")
-    parser.add_argument("--agent",       choices=list(AGENT_PROFILES.keys()),
-                        help="Agent profile to run")
+    parser.add_argument("--agent",       choices=list(all_profiles.keys()),
+                        help="Agent profile to run (built-in or manifest-registered)")
     parser.add_argument("--reconfigure", action="store_true",
                         help="Re-run setup for the selected agent")
     parser.add_argument("--list-agents", action="store_true",
@@ -1526,14 +1674,23 @@ def main():
     args = parser.parse_args()
 
     if args.list_agents:
-        print("\nAvailable agents:")
+        print("\nBuilt-in agents:")
         for name, p in AGENT_PROFILES.items():
-            print(f"  {name:15} — {p['name']}")
-            print(f"               Tracks: {', '.join(p['tracks'][:3])}...")
+            print(f"  {name:20} — {p['name']}")
+            print(f"  {'':20}   Tracks: {', '.join(p['tracks'][:3])}...")
+        if manifest_profiles:
+            print("\nManifest-registered agents:")
+            for name, p in manifest_profiles.items():
+                ns = p.get("memory_namespace", "—")
+                print(f"  {name:20} — {p['name']}  [namespace: {ns}]")
+                print(f"  {'':20}   Tracks: {', '.join(p.get('tracks', [])[:3])}...")
+        else:
+            print("\nNo manifest agents found. "
+                  "Add *.json manifests to ~/.dream_cycle/agents/ to register agents.")
         return
 
     agent_name = args.agent or "ai_research"
-    profile    = AGENT_PROFILES[agent_name]
+    profile    = all_profiles[agent_name]
     dirs       = get_agent_dirs(agent_name)
     date_str   = datetime.now().strftime("%Y-%m-%d")
     run_id     = f"{agent_name}_{date_str}_{datetime.now().strftime('%H%M%S')}"
