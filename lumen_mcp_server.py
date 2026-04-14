@@ -46,6 +46,7 @@ Trust rules
 from __future__ import annotations
 
 import os
+import re
 import secrets
 import sys
 import uuid
@@ -148,6 +149,25 @@ def _auth_error() -> dict | None:
     return None
 
 
+# ── Namespace validation ──────────────────────────────────────────────────────
+
+# Must match dream_cycle.py _SAFE_ID_RE — kept in sync manually.
+_SAFE_NS_RE = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
+
+
+def _validate_namespace(namespace: str) -> dict | None:
+    """Return a 400 error dict if namespace is not a safe identifier; None if OK."""
+    if not isinstance(namespace, str) or not _SAFE_NS_RE.match(namespace):
+        return {
+            "error":  "400 Bad Request",
+            "reason": (
+                f"Invalid namespace '{namespace}'. "
+                "Must match ^[a-z][a-z0-9_]{0,62}$ (lowercase, no separators)."
+            ),
+        }
+    return None
+
+
 # ── Server ────────────────────────────────────────────────────────────────────
 mcp = FastMCP("lumen")
 
@@ -186,6 +206,8 @@ def add_memory(content: str, namespace: str,
     """
     if (err := _auth_error()):
         return err
+    if (err := _validate_namespace(namespace)):
+        return err
     tags = tags or []
     coll = _get_collection()
     memory_id = f"{namespace}_{uuid.uuid4().hex[:12]}"
@@ -217,6 +239,8 @@ def query_memory(query: str, namespace: str, n: int = 5) -> list[dict]:
         [{"error": "401 Unauthorized"}] when auth fails.
     """
     if (err := _auth_error()):
+        return [err]
+    if (err := _validate_namespace(namespace)):
         return [err]
     coll = _get_collection()
     try:
@@ -285,6 +309,8 @@ def delete_memory(id: str, namespace: str) -> dict:
         {"error": "not_found"}        when id does not exist.
     """
     if (err := _auth_error()):
+        return err
+    if (err := _validate_namespace(namespace)):
         return err
     coll = _get_collection()
     result = coll.get(ids=[id], include=["metadatas"])

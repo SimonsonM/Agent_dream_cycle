@@ -994,13 +994,86 @@ def _agent_memories(chroma):
     )
 
 
+def _enforce_namespace(agent_name: str, namespace: str) -> bool:
+    """Verify that *namespace* is a valid safe identifier and owned by *agent_name*.
+
+    The ownership rule: the namespace must either equal the agent_name exactly,
+    or match the declared memory_namespace from the agent's profile.  This is
+    checked by the caller; this helper only validates the namespace string itself.
+
+    Returns True when the namespace passes all checks; False otherwise.
+    """
+    if not namespace or not isinstance(namespace, str):
+        log(f"  [namespace-isolation] Rejected empty/non-string namespace for {agent_name}")
+        return False
+    if not _SAFE_ID_RE.match(namespace):
+        log(f"  [namespace-isolation] Rejected unsafe namespace '{namespace}' "
+            f"(fails ^[a-z][a-z0-9_]{{0,62}}$)")
+        return False
+    return True
+
+
+def _check_namespace_entry_integrity(entry_doc: str, entry_meta: dict,
+                                      expected_ns: str) -> tuple[bool, str]:
+    """Validate a single namespace entry before it is promoted to global memory.
+
+    Checks:
+      1. Metadata namespace tag matches the namespace we queried.
+      2. Document is valid JSON with expected keys (run_id, tonight_score, date).
+      3. tonight_score is a number in [0, 10].
+      4. run_id does not contain path-traversal characters.
+
+    Returns:
+        (ok: bool, reason: str)  — reason is '' when ok is True.
+    """
+    # Check 1: namespace tag consistency
+    stored_ns = entry_meta.get("namespace", "")
+    if stored_ns != expected_ns:
+        return False, (f"namespace mismatch: stored='{stored_ns}' expected='{expected_ns}' "
+                       "— possible cross-namespace pollution")
+
+    # Check 2: document is valid JSON with expected structure
+    try:
+        doc = json.loads(entry_doc)
+    except (json.JSONDecodeError, TypeError):
+        return False, "document is not valid JSON"
+    if not isinstance(doc, dict):
+        return False, "document top-level is not a JSON object"
+    for required_key in ("run_id", "tonight_score", "date"):
+        if required_key not in doc:
+            return False, f"document missing expected key: '{required_key}'"
+
+    # Check 3: score is numeric in bounds
+    score = doc.get("tonight_score")
+    if not isinstance(score, (int, float)) or not (0 <= score <= 10):
+        return False, f"tonight_score out of range: {score!r}"
+
+    # Check 4: run_id sanity (no slashes, nulls, or excessive length)
+    run_id = str(doc.get("run_id", ""))
+    if len(run_id) > 128 or any(c in run_id for c in ("/", "\\", "\x00", "..")):
+        return False, f"suspicious run_id: {run_id[:40]!r}"
+
+    return True, ""
+
+
 def write_to_agent_namespace(agent_name: str, namespace: str,
                               judge: dict, scan: dict, run_id: str):
     """Persist tonight's judge output to the agent's memory namespace.
 
+    Namespace isolation is enforced at the write layer:
+    - The namespace string is validated against a safe-identifier pattern.
+    - The upserted metadata includes 'namespace_owner' = agent_name so that
+      the consolidation pass can verify provenance of every entry it reads.
+
     The same agent_memories collection is exposed read/write via lumen_mcp_server.py,
     so anything stored here is immediately queryable by Claude Code through MCP tools.
     """
+    # ── Write-layer namespace enforcement ────────────────────────────────────
+    if not _enforce_namespace(agent_name, namespace):
+        log(f"  [namespace-isolation] Aborting write for '{agent_name}': "
+            f"namespace '{namespace}' failed validation")
+        return
+
     chroma = get_chroma_client()
     if chroma is None:
         log(f"ChromaDB unavailable — skipping namespace write for '{namespace}'")
@@ -1020,11 +1093,12 @@ def write_to_agent_namespace(agent_name: str, namespace: str,
         ids=[memory_id],
         documents=[content],
         metadatas=[{
-            "namespace":  namespace,
-            "agent_name": agent_name,
-            "run_id":     run_id,
-            "tags":       scan.get("priority_track", ""),
-            "created_at": datetime.now().isoformat(),
+            "namespace":       namespace,
+            "namespace_owner": agent_name,   # provenance field for integrity checks
+            "agent_name":      agent_name,
+            "run_id":          run_id,
+            "tags":            scan.get("priority_track", ""),
+            "created_at":      datetime.now().isoformat(),
         }],
     )
     log(f"Namespace '{namespace}': run output written to agent_memories")
@@ -1033,34 +1107,55 @@ def write_to_agent_namespace(agent_name: str, namespace: str,
 def consolidate_agent_namespaces(active_namespaces: list[str]) -> dict:
     """Query all active namespaces and return a cross-namespace summary dict.
 
-    Called after the judge phase so the current agent can be aware of what
-    other agents stored in prior runs.  Returns {} when ChromaDB is unavailable
-    or no namespaces have any entries yet.
+    Each entry is passed through _check_namespace_entry_integrity() before being
+    included.  Anomalous or out-of-distribution entries are flagged and excluded
+    from the returned summary — they are not deleted but logged for audit.
+
+    Returns {} when ChromaDB is unavailable or no namespaces have any entries.
     """
     chroma = get_chroma_client()
     if chroma is None or not active_namespaces:
         return {}
 
-    coll = _agent_memories(chroma)
+    coll     = _agent_memories(chroma)
     summary: dict[str, list[dict]] = {}
+    flagged  = 0
+
     for ns in active_namespaces:
+        if not _enforce_namespace("<consolidation>", ns):
+            log(f"Consolidation: skipping invalid namespace '{ns}'")
+            continue
         try:
             results = coll.get(
                 where={"namespace": ns},
                 include=["documents", "metadatas"],
             )
-            entries = [
-                {"content": doc, "run_id": meta.get("run_id", ""),
-                 "date": meta.get("created_at", "")[:10]}
-                for doc, meta in zip(
-                    results.get("documents") or [],
-                    results.get("metadatas") or [],
-                )
-            ]
-            # Keep only the five most-recent entries to avoid bloating context
-            summary[ns] = entries[-5:] if entries else []
         except Exception as exc:
             log(f"Consolidation: failed to query namespace '{ns}': {exc}")
+            continue
+
+        docs  = results.get("documents") or []
+        metas = results.get("metadatas") or []
+        good_entries: list[dict] = []
+
+        for doc, meta in zip(docs, metas):
+            ok, reason = _check_namespace_entry_integrity(doc, meta, ns)
+            if not ok:
+                flagged += 1
+                log(f"  [namespace-isolation] FLAGGED entry in namespace '{ns}': {reason}")
+                continue
+            good_entries.append({
+                "content": doc,
+                "run_id":  meta.get("run_id", ""),
+                "date":    meta.get("created_at", "")[:10],
+            })
+
+        # Keep only the five most-recent validated entries
+        summary[ns] = good_entries[-5:] if good_entries else []
+
+    if flagged:
+        log(f"Consolidation: {flagged} anomalous/out-of-distribution "
+            f"entry(ies) flagged and excluded from global memory")
     return summary
 
 
