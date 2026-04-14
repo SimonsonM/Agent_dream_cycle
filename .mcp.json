@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "lumen": {
+      "type": "stdio",
+      "command": "python3",
+      "args": ["lumen_mcp_server.py"],
+      "description": "Lumen — per-agent memory namespaces backed by ChromaDB"
+    }
+  }
+}
