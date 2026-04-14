@@ -81,6 +81,25 @@ const TRACKS = [
   { name: "Data Analytics", icon: "◎", desc: "Power BI, Fabric, MLflow, pipelines" },
 ];
 
+// ── Built-in agents shown on the AGENTS tab ────────────────────────────────
+const BUILTIN_AGENTS = [
+  { id: "ai_research",  name: "AI Research Agent",         namespace: "ai_research",  type: "research",    builtin: true },
+  { id: "security",     name: "Security Research Agent",   namespace: "security",     type: "security",    builtin: true },
+  { id: "programming",  name: "Programming Intelligence",  namespace: "programming",  type: "programming", builtin: true },
+  { id: "marketing",    name: "Marketing Intelligence",    namespace: "marketing",    type: "marketing",   builtin: true },
+];
+
+const MANIFEST_SCHEMA = [
+  { field: "id",               required: true,  desc: "Unique agent identifier" },
+  { field: "name",             required: true,  desc: "Human-readable display name" },
+  { field: "version",          required: true,  desc: "Semver string (e.g. 1.0.0)" },
+  { field: "type",             required: true,  desc: "research | security | marketing | programming" },
+  { field: "memory_namespace", required: true,  desc: "Lumen ChromaDB namespace for this agent" },
+  { field: "scan_targets",     required: true,  desc: "Array: arxiv | github_trending | cves | github_releases" },
+  { field: "active",           required: true,  desc: "Boolean — false skips the agent at startup" },
+  { field: "mcp_endpoint",     required: false, desc: "Optional custom MCP server URL" },
+];
+
 const FILES = [
   { name: "dream_cycle.py", role: "Main orchestrator — runs at 11:15 PM", path: "~/dream-cycle/" },
   { name: "build_job.py", role: "4 AM build — applies low-risk changes", path: "~/dream-cycle/" },
@@ -175,7 +194,7 @@ export default function DreamCycle() {
 
         {/* Tabs */}
         <div style={{ display: "flex", gap: 2, marginBottom: 24, borderBottom: "1px solid #1a1a2e" }}>
-          {["phases", "tracks", "risk", "files", "commands"].map(tab => (
+          {["phases", "agents", "tracks", "risk", "files", "commands"].map(tab => (
             <button key={tab} onClick={() => setActiveTab(tab)} style={{
               background: activeTab === tab ? "#0d0d1a" : "transparent",
               border: "none", borderBottom: activeTab === tab ? "2px solid #4daaff" : "2px solid transparent",
@@ -264,6 +283,74 @@ export default function DreamCycle() {
                   </div>
                 ))}
               </div>
+            </div>
+          </div>
+        )}
+
+        {/* AGENTS TAB */}
+        {activeTab === "agents" && (
+          <div>
+            <div style={{ fontSize: 11, color: "#555", marginBottom: 20, lineHeight: 1.6 }}>
+              Agents are discovered at startup from two sources: built-in profiles compiled into the
+              orchestrator, and manifest files placed in <code style={{ color: "#4daaff", background: "#0a0a1a", padding: "1px 4px" }}>~/.dream_cycle/agents/*.json</code>.
+              Each agent writes its nightly output to an isolated memory namespace in ChromaDB,
+              accessible via the Lumen MCP server.
+            </div>
+
+            {/* Built-in agents */}
+            <div style={{ fontSize: 9, color: "#444", letterSpacing: 2, marginBottom: 10 }}>BUILT-IN AGENTS</div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 24 }}>
+              {BUILTIN_AGENTS.map(a => (
+                <div key={a.id} style={{ padding: 16, background: "#0d0d1a", border: "1px solid #1a1a2e", borderRadius: 4 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                    <span style={{ fontSize: 9, padding: "2px 6px", background: "#00ff9d18", color: "#00ff9d", borderRadius: 2, letterSpacing: 1 }}>BUILT-IN</span>
+                    <span style={{ fontSize: 12, color: "#fff", fontWeight: 700 }}>{a.id}</span>
+                  </div>
+                  <div style={{ fontSize: 11, color: "#888", marginBottom: 4 }}>{a.name}</div>
+                  <div style={{ fontSize: 10, color: "#444" }}>
+                    namespace: <span style={{ color: "#4daaff" }}>{a.namespace}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {/* Manifest-registered agents */}
+            <div style={{ fontSize: 9, color: "#444", letterSpacing: 2, marginBottom: 10 }}>MANIFEST-REGISTERED AGENTS</div>
+            <div style={{ padding: 16, background: "#0d0d1a", border: "1px solid #1a1a2e", borderRadius: 4, marginBottom: 24 }}>
+              <div style={{ fontSize: 11, color: "#666", lineHeight: 1.6, marginBottom: 12 }}>
+                Drop a <code style={{ color: "#4daaff", background: "#0a0a1a", padding: "1px 4px" }}>*.json</code> file
+                into <code style={{ color: "#4daaff", background: "#0a0a1a", padding: "1px 4px" }}>~/.dream_cycle/agents/</code> (Linux/macOS)
+                or <code style={{ color: "#4daaff", background: "#0a0a1a", padding: "1px 4px" }}>%APPDATA%\dream_cycle\agents\</code> (Windows).
+                The cycle picks it up on next startup — no code changes required.
+              </div>
+              <div style={{ fontSize: 9, color: "#444", letterSpacing: 2, marginBottom: 8 }}>MANIFEST SCHEMA</div>
+              {MANIFEST_SCHEMA.map(s => (
+                <div key={s.field} style={{ display: "flex", gap: 12, padding: "5px 0", borderBottom: "1px solid #111" }}>
+                  <code style={{ width: 160, fontSize: 11, color: s.required ? "#4daaff" : "#555", flexShrink: 0 }}>{s.field}</code>
+                  <span style={{ fontSize: 10, color: "#333", width: 60, flexShrink: 0 }}>{s.required ? "required" : "optional"}</span>
+                  <span style={{ fontSize: 11, color: "#666" }}>{s.desc}</span>
+                </div>
+              ))}
+            </div>
+
+            {/* Lumen MCP */}
+            <div style={{ fontSize: 9, color: "#444", letterSpacing: 2, marginBottom: 10 }}>LUMEN MCP SERVER</div>
+            <div style={{ padding: 16, background: "#0d0d1a", border: "1px solid #9d4dff22", borderLeft: "3px solid #9d4dff", borderRadius: 4 }}>
+              <div style={{ fontSize: 11, color: "#888", marginBottom: 12, lineHeight: 1.6 }}>
+                <code style={{ color: "#9d4dff", background: "#0a0a1a", padding: "1px 4px" }}>lumen_mcp_server.py</code> exposes
+                the same ChromaDB collection as MCP tools. Claude Code connects via <code style={{ color: "#9d4dff", background: "#0a0a1a", padding: "1px 4px" }}>.mcp.json</code>.
+              </div>
+              {[
+                { tool: "add_memory(content, namespace, tags[])", desc: "Write a memory to a namespace" },
+                { tool: "query_memory(query, namespace, n)",      desc: "Cosine-similarity search within a namespace" },
+                { tool: "list_namespaces()",                      desc: "Enumerate all namespaces with stored data" },
+                { tool: "delete_memory(id, namespace)",           desc: "Delete own-namespace entries only (trust rule)" },
+              ].map(t => (
+                <div key={t.tool} style={{ display: "flex", gap: 12, padding: "6px 0", borderBottom: "1px solid #111" }}>
+                  <code style={{ fontSize: 10, color: "#9d4dff", width: 320, flexShrink: 0 }}>{t.tool}</code>
+                  <span style={{ fontSize: 11, color: "#666" }}>{t.desc}</span>
+                </div>
+              ))}
             </div>
           </div>
         )}

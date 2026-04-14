@@ -98,15 +98,87 @@ Edit `TRACKS` in `dream_cycle.py` to match your work.
 
 ---
 
+---
+
+## Agent Auto-Detection
+
+Agents are loaded from two sources on every startup:
+
+**Built-in profiles** — `security`, `marketing`, `programming`, `ai_research` compiled into `dream_cycle.py`.
+
+**Manifest files** — any `*.json` file placed in a platform-appropriate directory:
+
+| Platform | Directory |
+|----------|-----------|
+| Linux    | `~/.dream_cycle/agents/` |
+| macOS    | `~/.dream_cycle/agents/` and `~/Library/Application Support/dream_cycle/agents/` |
+| Windows  | `%APPDATA%\dream_cycle\agents\` (plus optional `HKCU\Software\DreamCycle\Agents` registry keys) |
+
+Copy `agents/example_agent.json` to get started:
+
+```json
+{
+  "id":               "my_agent",
+  "name":             "My Custom Agent",
+  "version":          "1.0.0",
+  "type":             "research",
+  "memory_namespace": "my_agent",
+  "scan_targets":     ["arxiv", "github_trending"],
+  "active":           true,
+  "mcp_endpoint":     ""
+}
+```
+
+Required fields: `id`, `name`, `version`, `type`, `memory_namespace`, `scan_targets`, `active`.
+
+Setting `active: false` skips the agent at startup without deleting the file.  The `type` field maps the agent to the nearest built-in scanning profile (`research` → `ai_research`, `security`, `marketing`, `programming`).
+
+```bash
+# List all registered agents (built-in + manifest)
+python3 ~/dream-cycle/dream_cycle.py --list-agents
+
+# Run a manifest-registered agent
+python3 ~/dream-cycle/dream_cycle.py --agent my_agent
+```
+
+---
+
+## Lumen MCP Server
+
+`lumen_mcp_server.py` exposes per-agent memory namespaces via FastMCP so Claude Code (and other MCP clients) can read and write agent memories without touching ChromaDB directly.
+
+**Install:**
+```bash
+pip install mcp chromadb
+```
+
+**Register** (already done via `.mcp.json` — Claude Code picks it up automatically).
+
+**Tools:**
+
+| Tool | Description |
+|------|-------------|
+| `add_memory(content, namespace, tags[])` | Write a memory to a namespace |
+| `query_memory(query, namespace, n)` | Cosine-similarity search within a namespace |
+| `list_namespaces()` | List all namespaces with stored data |
+| `delete_memory(id, namespace)` | Delete an entry (own namespace only — cross-namespace deletes are rejected) |
+
+The backend is the `agent_memories` ChromaDB collection at `~/dream-cycle/chroma_db` — the same path used by the dream cycle itself.  Memories written during a nightly run are immediately queryable via MCP tools, and vice versa.
+
+---
+
 ## Requirements
 
 - Python 3.10+
 - [Ollama](https://ollama.com) with a local model pulled
 - Anthropic API key (`ANTHROPIC_API_KEY` in environment)
-- Ubuntu / macOS with cron available
+- Ubuntu / macOS / Windows with cron or Task Scheduler available
 
 ```bash
-pip install anthropic requests
+pip install anthropic requests          # required
+pip install chromadb                    # optional — enables memory persistence
+pip install mcp                         # optional — enables Lumen MCP server
+pip install pyyaml                      # optional — enables config.yaml features
 ```
 
 ---
@@ -156,17 +228,33 @@ Even a few logged events per day gives the reflection phase something real to wo
 ## File Structure
 
 ```
-dream-cycle/
-  dream_cycle.py              Main orchestrator — runs at 11:15 PM
-  build_job.py                4 AM build — applies low-risk staged changes
-  perf_log.py                 Performance logger — call from your agents
-  setup.sh                    One-time install and cron registration
-  dream-staging/
-    YYYY-MM-DD_manifest.json  Tonight's staged action manifest
-    *.staged                  Individual staged actions (JSON)
-    applied/
-      rollback_*.sh           Rollback scripts for every applied change
-  performance.jsonl           Agent event log — feeds reflection phase
+dream-cycle/                    (repo)
+  dream_cycle.py                Main orchestrator — runs at 11:15 PM
+  build_job.py                  4 AM build — applies low-risk staged changes
+  perf_log.py                   Performance logger — call from your agents
+  set_up.sh                     One-time install and cron registration
+  config.yaml                   Extended feature config (arXiv, decay, bridge...)
+  lumen_mcp_server.py           MCP server — per-agent memory namespaces
+  .mcp.json                     Registers Lumen with Claude Code
+  agents/
+    example_agent.json          Manifest schema reference (active: false)
+
+~/dream-cycle/                  (runtime, created by set_up.sh)
+  config.json                   Model selection and per-agent repo lists
+  chroma_db/                    ChromaDB — lessons, run nodes, agent memories
+  <AGENT>/
+    staging/
+      YYYY-MM-DD_manifest.json  Tonight's staged action manifest
+      *.staged                  Individual staged actions (JSON)
+      applied/
+        rollback_*.sh           Rollback scripts for every applied change
+    logs/
+      YYYY-MM-DD-changelog.md   Morning research report
+    performance.jsonl           Agent event log — feeds Phase 2
+    seen_cache.json             Dedup cache (7-day TTL)
+
+~/.dream_cycle/agents/          (manifest registry — add your own here)
+  *.json                        Custom agent manifests
 
 ~/dream-logs/
   YYYY-MM-DD-changelog.md

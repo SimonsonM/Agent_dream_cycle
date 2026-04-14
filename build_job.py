@@ -17,9 +17,22 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 
-BASE_DIR    = Path.home() / "dream-cycle"
-LOGS_DIR    = Path.home() / "dream-logs"
-AGENT_NAMES = ["security", "marketing", "programming", "ai_research"]
+BASE_DIR = Path.home() / "dream-cycle"
+LOGS_DIR = Path.home() / "dream-logs"
+
+
+def discover_agent_names() -> list[str]:
+    """Return agent names by scanning BASE_DIR for subdirs that have a staging dir.
+
+    This replaces the old hardcoded AGENT_NAMES list and automatically picks up
+    any manifest-registered agents whose first run has already created directories.
+    """
+    if not BASE_DIR.exists():
+        return []
+    return sorted(
+        d.name for d in BASE_DIR.iterdir()
+        if d.is_dir() and (d / "staging").is_dir()
+    )
 
 
 def log(msg: str):
@@ -140,8 +153,8 @@ def run_agent_build(agent_name: str, date_str: str) -> tuple[list, list]:
 
 def main():
     parser = argparse.ArgumentParser(description="Dream Cycle Build Job")
-    parser.add_argument("--agent", choices=AGENT_NAMES,
-                        help="Run build for a specific agent (default: all)")
+    parser.add_argument("--agent",
+                        help="Run build for a specific agent (default: all with staging dirs)")
     args = parser.parse_args()
 
     date_str = datetime.now().strftime("%Y-%m-%d")
@@ -150,10 +163,7 @@ def main():
     if args.agent:
         agents_to_run = [args.agent]
     else:
-        agents_to_run = [
-            name for name in AGENT_NAMES
-            if (BASE_DIR / name / "staging").exists()
-        ]
+        agents_to_run = discover_agent_names()
         if not agents_to_run:
             log("No agent staging dirs found. Nothing to do.")
             return
