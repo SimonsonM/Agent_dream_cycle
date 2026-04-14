@@ -9,5 +9,6 @@
     "github_trending"
   ],
   "active": false,
-  "mcp_endpoint": "http://localhost:8765"
+  "token_budget": 2000,
+  "mcp_endpoint": ""
 }

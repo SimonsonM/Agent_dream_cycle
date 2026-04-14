@@ -39,6 +39,14 @@ except ImportError:
 
 import platform
 import random
+import re
+from urllib.parse import urlparse
+
+try:
+    import jsonschema
+    JSONSCHEMA_AVAILABLE = True
+except ImportError:
+    JSONSCHEMA_AVAILABLE = False
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 BASE_DIR    = Path.home() / "dream-cycle"
@@ -208,10 +216,6 @@ def set_agent_config(config: dict, agent_name: str, agent_cfg: dict) -> dict:
 
 # ── Manifest-based agent registry ─────────────────────────────────────────────
 
-# Fields every manifest must provide (active agents only).
-MANIFEST_REQUIRED_FIELDS = {"id", "name", "version", "type", "memory_namespace",
-                             "scan_targets", "active"}
-
 # Agent types that map to an existing built-in profile for default scanning config.
 _MANIFEST_TYPE_TO_BUILTIN = {
     "security":    "security",
@@ -219,6 +223,163 @@ _MANIFEST_TYPE_TO_BUILTIN = {
     "programming": "programming",
     "research":    "ai_research",
 }
+
+# Safe identifier pattern: lowercase letter, then alphanumeric/underscore, 1–63 chars total.
+_SAFE_ID_RE = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
+
+# Strict JSON Schema for manifest files.  additionalProperties: false ensures no
+# unexpected fields sneak through — a common vector for prototype-pollution style attacks.
+MANIFEST_JSON_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "id": {
+            "type": "string",
+            "pattern": r"^[a-z][a-z0-9_]{0,62}$",
+            "description": "Unique agent identifier (lowercase, alphanumeric/underscore)",
+        },
+        "name":    {"type": "string", "minLength": 1, "maxLength": 100},
+        "version": {
+            "type": "string",
+            "pattern": r"^\d+\.\d+\.\d+$",
+            "description": "Semantic version string (e.g. 1.0.0)",
+        },
+        "type": {
+            "type": "string",
+            "enum": ["research", "security", "marketing", "programming"],
+        },
+        "memory_namespace": {
+            "type": "string",
+            "pattern": r"^[a-z][a-z0-9_]{0,62}$",
+        },
+        "scan_targets": {
+            "type": "array",
+            "items": {
+                "type": "string",
+                # Closed enum — prevents arbitrary filesystem paths from entering
+                "enum": ["arxiv", "github_trending", "cves", "github_releases"],
+            },
+            "uniqueItems": True,
+            "maxItems": 4,
+        },
+        "active":       {"type": "boolean"},
+        "token_budget": {
+            "type": "integer",
+            "minimum": 100,
+            "maximum": 8000,
+            "description": "Max tokens of scan output per agent (default 2000)",
+        },
+        "mcp_endpoint": {"type": "string", "maxLength": 256},
+        "checksum":     {
+            "type": "string",
+            "pattern": r"^[0-9a-f]{64}$",
+            "description": "Optional SHA-256 hex digest of this file (excluding this field)",
+        },
+    },
+    "required": ["id", "name", "version", "type", "memory_namespace",
+                 "scan_targets", "active"],
+    "additionalProperties": False,
+}
+
+# Allowed URL schemes for mcp_endpoint values.
+_ALLOWED_MCP_SCHEMES = {"http", "https"}
+
+
+def _validate_manifest_schema(manifest: dict, source: str) -> list[str]:
+    """Return a list of schema violation strings; empty list means the manifest is valid.
+
+    Uses jsonschema when available; falls back to manual required-field and type
+    checks when it is not installed so the validator degrades gracefully.
+    """
+    errors: list[str] = []
+
+    if JSONSCHEMA_AVAILABLE:
+        try:
+            validator = jsonschema.Draft7Validator(MANIFEST_JSON_SCHEMA)
+            for err in sorted(validator.iter_errors(manifest), key=str):
+                path = ".".join(str(p) for p in err.absolute_path) or "<root>"
+                errors.append(f"{path}: {err.message}")
+        except Exception as exc:
+            errors.append(f"Schema validation exception: {exc}")
+        return errors
+
+    # ── Fallback: manual checks (no jsonschema) ───────────────────────────────
+    required = MANIFEST_JSON_SCHEMA["required"]
+    for field in required:
+        if field not in manifest:
+            errors.append(f"Missing required field: {field}")
+
+    # Reject unexpected fields
+    allowed = set(MANIFEST_JSON_SCHEMA["properties"].keys())
+    extra   = set(manifest.keys()) - allowed
+    if extra:
+        errors.append(f"Unexpected fields (additionalProperties=false): {extra}")
+
+    # Type checks for critical fields
+    str_fields = ["id", "name", "version", "type", "memory_namespace"]
+    for f in str_fields:
+        if f in manifest and not isinstance(manifest[f], str):
+            errors.append(f"Field '{f}' must be a string")
+    if "active" in manifest and not isinstance(manifest["active"], bool):
+        errors.append("Field 'active' must be a boolean")
+    if "scan_targets" in manifest:
+        if not isinstance(manifest["scan_targets"], list):
+            errors.append("Field 'scan_targets' must be an array")
+        else:
+            allowed_targets = {"arxiv", "github_trending", "cves", "github_releases"}
+            for t in manifest["scan_targets"]:
+                if t not in allowed_targets:
+                    errors.append(f"scan_targets: '{t}' is not an allowed value")
+
+    # ID/namespace pattern
+    for id_field in ("id", "memory_namespace"):
+        val = manifest.get(id_field, "")
+        if isinstance(val, str) and not _SAFE_ID_RE.match(val):
+            errors.append(f"Field '{id_field}' fails pattern ^[a-z][a-z0-9_]{{0,62}}$")
+
+    return errors
+
+
+def _validate_manifest_checksum(manifest: dict, manifest_path: Path) -> bool:
+    """If the manifest includes a 'checksum' field, verify it matches the file's SHA-256.
+
+    The digest is computed over the raw bytes of the file as stored on disk.
+    Returns True when the checksum is absent (nothing to verify) or matches.
+    Returns False (and logs a warning) when it is present and does not match.
+    """
+    declared = manifest.get("checksum")
+    if not declared:
+        return True  # field absent — optional, no verification needed
+
+    raw = manifest_path.read_bytes()
+    computed = hashlib.sha256(raw).hexdigest()
+    if computed != declared:
+        log(f"  CHECKSUM MISMATCH in {manifest_path.name}: "
+            f"declared={declared[:12]}… computed={computed[:12]}…")
+        return False
+    return True
+
+
+def _validate_mcp_endpoint(url: str, source: str) -> bool:
+    """Return True if the mcp_endpoint value is safe; log and return False otherwise.
+
+    Only http:// and https:// schemes are allowed.  file://, javascript:, data:,
+    and bare paths are all rejected to prevent SSRF / local-file reads.
+    """
+    if not url:
+        return True  # empty — no endpoint configured, that is fine
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in _ALLOWED_MCP_SCHEMES:
+            log(f"  Rejected mcp_endpoint '{url}' in {source}: "
+                f"scheme '{parsed.scheme}' not in {_ALLOWED_MCP_SCHEMES}")
+            return False
+        if not parsed.netloc:
+            log(f"  Rejected mcp_endpoint '{url}' in {source}: missing host")
+            return False
+    except Exception as exc:
+        log(f"  Rejected mcp_endpoint '{url}' in {source}: parse error {exc}")
+        return False
+    return True
 
 
 def get_agent_manifest_dirs() -> list[Path]:
@@ -247,7 +408,9 @@ def get_agent_manifest_dirs() -> list[Path]:
         appdata = os.environ.get("APPDATA")
         if appdata:
             candidates.append(Path(appdata) / "dream_cycle" / "agents")
-        # Optional: scan HKCU\Software\DreamCycle\Agents for extra paths
+        # Optional: scan HKCU\Software\DreamCycle\Agents for extra paths.
+        # Registry paths are collected here but flagged as untrusted in
+        # load_agent_manifests() — see _REGISTRY_SOURCED_DIRS.
         try:
             import winreg  # type: ignore[import]
             key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
@@ -255,8 +418,10 @@ def get_agent_manifest_dirs() -> list[Path]:
             i = 0
             while True:
                 try:
-                    _name, value, _type = winreg.EnumValue(key, i)
-                    candidates.append(Path(value))
+                    _name, value, _reg_type = winreg.EnumValue(key, i)
+                    rpath = Path(value)
+                    candidates.append(rpath)
+                    _REGISTRY_SOURCED_DIRS.add(rpath.resolve())
                     i += 1
                 except OSError:
                     break
@@ -267,12 +432,23 @@ def get_agent_manifest_dirs() -> list[Path]:
     return [d for d in candidates if d.is_dir()]
 
 
+# Populated by get_agent_manifest_dirs() on Windows; used by load_agent_manifests()
+# to apply additional scrutiny to registry-sourced paths (Commit 5 hardening).
+_REGISTRY_SOURCED_DIRS: set[Path] = set()
+
+
 def load_agent_manifests() -> dict:
     """Scan all platform manifest dirs and build a registry of active agents.
 
-    Returns a dict keyed by agent id.  Invalid manifests (missing fields,
-    JSON errors, inactive) are silently skipped with a log message.
-    Duplicate IDs: first encountered wins.
+    Validation pipeline per manifest file:
+      1. JSON parse (TypeError/ValueError → skip)
+      2. JSON Schema (strict: required fields, types, no extra fields)
+      3. Optional SHA-256 checksum verification
+      4. mcp_endpoint URL scheme allow-list
+      5. Inactive manifests are silently skipped
+      6. Duplicate IDs: first encountered wins
+
+    Never raises; invalid manifests are logged and skipped.
     """
     registry: dict[str, dict] = {}
     dirs = get_agent_manifest_dirs()
@@ -281,61 +457,81 @@ def load_agent_manifests() -> dict:
 
     log(f"Scanning {len(dirs)} manifest dir(s): {[str(d) for d in dirs]}")
     for manifest_dir in dirs:
+        is_registry_path = manifest_dir.resolve() in _REGISTRY_SOURCED_DIRS
+
         for manifest_file in sorted(manifest_dir.glob("*.json")):
+            # ── Step 1: Parse JSON ────────────────────────────────────────────
             try:
-                with open(manifest_file) as f:
-                    manifest = json.load(f)
+                raw_bytes = manifest_file.read_bytes()
+                manifest  = json.loads(raw_bytes)
+                if not isinstance(manifest, dict):
+                    raise TypeError("top-level value is not a JSON object")
             except Exception as exc:
                 log(f"  Manifest parse error ({manifest_file.name}): {exc}")
                 continue
 
-            missing = MANIFEST_REQUIRED_FIELDS - set(manifest.keys())
-            if missing:
-                log(f"  Skipping {manifest_file.name}: missing fields {missing}")
+            # ── Step 2: JSON Schema validation ────────────────────────────────
+            schema_errors = _validate_manifest_schema(manifest, manifest_file.name)
+            if schema_errors:
+                for err in schema_errors:
+                    log(f"  Schema error in {manifest_file.name}: {err}")
+                log(f"  Skipping {manifest_file.name}: failed schema validation "
+                    f"({len(schema_errors)} error(s))")
                 continue
+
+            # ── Step 3: Optional SHA-256 checksum ────────────────────────────
+            if not _validate_manifest_checksum(manifest, manifest_file):
+                log(f"  Skipping {manifest_file.name}: checksum mismatch")
+                continue
+
+            # ── Step 4: mcp_endpoint URL allow-list ──────────────────────────
+            endpoint = manifest.get("mcp_endpoint", "")
+            if not _validate_mcp_endpoint(endpoint, manifest_file.name):
+                log(f"  Skipping {manifest_file.name}: invalid mcp_endpoint")
+                continue
+
+            # ── Step 5: Active flag ───────────────────────────────────────────
             if not manifest.get("active", False):
                 log(f"  Skipping {manifest_file.name}: inactive")
                 continue
 
-            agent_id = str(manifest["id"])
+            # ── Step 6: Duplicate ID guard ────────────────────────────────────
+            agent_id = manifest["id"]
             if agent_id in registry:
                 log(f"  Duplicate id '{agent_id}' in {manifest_file.name} — skipped")
                 continue
 
             registry[agent_id] = manifest
-            log(f"  Registered manifest agent: {agent_id} ({manifest['name']})")
+            trust_label = " [REGISTRY-SOURCED — untrusted]" if is_registry_path else ""
+            log(f"  Registered manifest agent: {agent_id} ({manifest['name']}){trust_label}")
 
     return registry
 
 
 def manifest_to_profile(manifest: dict) -> dict:
-    """Convert a manifest dict to an AGENT_PROFILES-compatible profile dict.
+    """Convert a validated manifest dict to an AGENT_PROFILES-compatible profile dict.
 
     The manifest's *type* selects the closest built-in profile as a base for
     scan configuration (arxiv queries, GitHub trending, CVE toggle, etc.).
     Manifest-specific fields (memory_namespace, mcp_endpoint, scan_targets)
     are preserved as extra keys so the rest of the cycle can use them.
-    scan_targets overrides the fetch_* booleans from the base profile.
+    scan_targets is a closed enum validated by the schema, so no path expansion
+    is needed or performed here.
     """
-    base_key = _MANIFEST_TYPE_TO_BUILTIN.get(manifest.get("type", ""), "ai_research")
-    base = dict(AGENT_PROFILES[base_key])
-
+    base_key     = _MANIFEST_TYPE_TO_BUILTIN.get(manifest.get("type", ""), "ai_research")
+    base         = dict(AGENT_PROFILES[base_key])
     scan_targets: list[str] = manifest.get("scan_targets", [])
-    # Resolve any tilde/env-var paths in scan_targets at runtime
-    resolved_targets = [
-        str(Path(t).expanduser()) if t.startswith("~") else t
-        for t in scan_targets
-    ]
 
     return {
         **base,
         "name":             manifest["name"],
         "memory_namespace": manifest["memory_namespace"],
         "mcp_endpoint":     manifest.get("mcp_endpoint", ""),
-        "scan_targets":     resolved_targets,
-        "fetch_cves":           "cves" in scan_targets,
-        "fetch_github_trending": "github_trending" in scan_targets,
-        "_from_manifest":   True,
+        "scan_targets":     scan_targets,  # already validated enum values
+        "token_budget":     int(manifest.get("token_budget", 2000)),
+        "fetch_cves":              "cves" in scan_targets,
+        "fetch_github_trending":   "github_trending" in scan_targets,
+        "_from_manifest":          True,
     }
 
 # ── Per-agent directories ─────────────────────────────────────────────────────
