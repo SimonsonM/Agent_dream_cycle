@@ -22,7 +22,14 @@ from pathlib import Path
 
 import anthropic
 import requests
+import math
+import uuid
 import xml.etree.ElementTree as ET
+try:
+    import chromadb
+    CHROMA_AVAILABLE = True
+except ImportError:
+    CHROMA_AVAILABLE = False
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 BASE_DIR    = Path.home() / "dream-cycle"
@@ -31,11 +38,13 @@ CONFIG_FILE = BASE_DIR / "config.json"
 
 BASE_DIR.mkdir(parents=True, exist_ok=True)
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
+CHROMA_DIR = BASE_DIR / "chroma_db"
 
 # ── Models ────────────────────────────────────────────────────────────────────
-LOCAL_MODEL  = ""
-CLAUDE_MODEL = "claude-sonnet-4-6"
-client       = anthropic.Anthropic()
+LOCAL_MODEL    = ""
+CLAUDE_MODEL   = "claude-sonnet-4-6"
+client         = anthropic.Anthropic()
+UCB1_C_DEFAULT = 1.4
 
 # ── Agent Profiles ────────────────────────────────────────────────────────────
 AGENT_PROFILES = {
@@ -585,6 +594,187 @@ def ollama_compress(scan: dict, reflect: dict) -> dict:
         return {"scan_summary":    json.dumps(scan)[:600],
                 "reflect_summary": json.dumps(reflect)[:400]}
 
+# ── ChromaDB helpers ──────────────────────────────────────────────────────────
+
+def get_chroma_client():
+    """Return a persistent ChromaDB client, or None if chromadb is not installed."""
+    if not CHROMA_AVAILABLE:
+        return None
+    CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+    return chromadb.PersistentClient(path=str(CHROMA_DIR))
+
+
+def _lesson_corpus(chroma):
+    return chroma.get_or_create_collection(
+        name="lesson_corpus",
+        metadata={"hnsw:space": "cosine"},
+    )
+
+
+def _run_nodes(chroma):
+    return chroma.get_or_create_collection(
+        name="run_nodes",
+        metadata={"hnsw:space": "cosine"},
+    )
+
+
+# ── UCB1 scoring ──────────────────────────────────────────────────────────────
+
+def ucb1_score(times_selected: int, cumulative_value: float,
+               total_runs: int, C: float) -> float:
+    """UCB1 formula: mean_value + C * sqrt(ln(total_runs) / times_selected).
+    Nodes never selected before return +inf so they are always tried first."""
+    if times_selected == 0:
+        return float("inf")
+    mean = cumulative_value / times_selected
+    return mean + C * math.sqrt(math.log(total_runs) / times_selected)
+
+
+def select_context_parents(agent_name: str, k: int = 3,
+                           disable_ucb1: bool = False,
+                           C: float = UCB1_C_DEFAULT) -> list[dict]:
+    """Score all past run nodes for *agent_name* via UCB1 and return the top-k.
+
+    Each returned dict has: run_id, date_str, priority_track, tonight_score, summary.
+    Falls back to chronological (most-recent-first) when --disable-ucb1 is set or
+    when ChromaDB is unavailable.  Increments times_selected for chosen nodes.
+    """
+    chroma = get_chroma_client()
+    if chroma is None:
+        return []
+    coll = _run_nodes(chroma)
+    try:
+        results = coll.get(where={"agent_name": agent_name},
+                           include=["documents", "metadatas"])
+    except Exception as exc:
+        log(f"UCB1: ChromaDB query failed — {exc}")
+        return []
+
+    ids   = results.get("ids", [])
+    docs  = results.get("documents", [])
+    metas = results.get("metadatas", [])
+    if not ids:
+        return []
+
+    node_map = {rid: (doc, meta) for rid, doc, meta in zip(ids, docs, metas)}
+    total    = len(ids)
+
+    if disable_ucb1:
+        ordered = sorted(node_map.items(),
+                         key=lambda kv: kv[1][1].get("date_str", ""),
+                         reverse=True)
+        selected_ids = [rid for rid, _ in ordered[:k]]
+    else:
+        scored = [
+            (
+                ucb1_score(int(meta.get("times_selected", 0)),
+                           float(meta.get("cumulative_value", 0.0)),
+                           total, C),
+                rid,
+            )
+            for rid, (_, meta) in node_map.items()
+        ]
+        scored.sort(reverse=True, key=lambda x: x[0])
+        selected_ids = [rid for _, rid in scored[:k]]
+
+    parents = []
+    for rid in selected_ids:
+        doc, meta = node_map[rid]
+        parents.append({
+            "run_id":         rid,
+            "date_str":       meta.get("date_str", ""),
+            "priority_track": meta.get("priority_track", ""),
+            "tonight_score":  int(meta.get("tonight_score", 0)),
+            "summary":        doc,
+        })
+        # Increment times_selected immediately so concurrent runs see updated counts
+        coll.update(
+            ids=[rid],
+            metadatas=[{**meta,
+                        "times_selected": int(meta.get("times_selected", 0)) + 1}],
+        )
+
+    if parents:
+        mode = "sequential" if disable_ucb1 else "UCB1"
+        log(f"Context parents ({mode}): {[p['run_id'] for p in parents]}")
+    return parents
+
+
+def register_run_node(run_id: str, agent_name: str, date_str: str,
+                      priority_track: str = ""):
+    """Insert a skeleton run node before phases execute (stats start at zero)."""
+    chroma = get_chroma_client()
+    if chroma is None:
+        return
+    _run_nodes(chroma).upsert(
+        ids=[run_id],
+        documents=[""],
+        metadatas=[{
+            "agent_name":       agent_name,
+            "date_str":         date_str,
+            "priority_track":   priority_track,
+            "times_selected":   0,
+            "cumulative_value": 0.0,
+            "tonight_score":    0,
+        }],
+    )
+
+
+def update_run_node(run_id: str, tonight_score: int, summary: str):
+    """After a run completes, write the final score and summary into run_nodes."""
+    chroma = get_chroma_client()
+    if chroma is None:
+        return
+    coll = _run_nodes(chroma)
+    existing = coll.get(ids=[run_id], include=["metadatas"])
+    if not existing["ids"]:
+        return
+    meta = existing["metadatas"][0]
+    coll.update(
+        ids=[run_id],
+        documents=[summary],
+        metadatas=[{
+            **meta,
+            "tonight_score":    tonight_score,
+            "cumulative_value": float(meta.get("cumulative_value", 0.0)) + tonight_score,
+        }],
+    )
+    log(f"Run node {run_id} updated: score={tonight_score}")
+
+
+def store_lessons(lessons: list[dict], agent_name: str, run_id: str):
+    """Upsert structured lessons into the lesson_corpus ChromaDB collection.
+
+    Each lesson dict must contain at minimum a 'lesson' field.
+    tags[] is stored as a comma-joined string (ChromaDB metadata is flat).
+    """
+    if not lessons:
+        return
+    chroma = get_chroma_client()
+    if chroma is None:
+        log("ChromaDB unavailable — lessons not persisted")
+        return
+    coll = _lesson_corpus(chroma)
+    ids, documents, metadatas = [], [], []
+    for i, lesson in enumerate(lessons):
+        text = lesson.get("lesson", "").strip()
+        if not text:
+            continue
+        tags = lesson.get("tags", [])
+        ids.append(f"{agent_name}_{run_id}_{i}")
+        documents.append(text)
+        metadatas.append({
+            "domain":        str(lesson.get("domain", "")),
+            "confidence":    float(lesson.get("confidence", 0.5)),
+            "source_run_id": str(lesson.get("source_run_id", run_id)),
+            "tags":          ",".join(tags) if isinstance(tags, list) else str(tags),
+            "agent_name":    agent_name,
+        })
+    if ids:
+        coll.upsert(ids=ids, documents=documents, metadatas=metadatas)
+        log(f"Stored {len(ids)} lesson(s) in lesson_corpus")
+
+
 # ── Phase 1: Scan ─────────────────────────────────────────────────────────────
 
 def phase_scan(profile: dict, agent_cfg: dict, seen_cache: dict) -> dict:
@@ -672,7 +862,8 @@ Return JSON only:
 
 # ── Phase 3: Deep Research ────────────────────────────────────────────────────
 
-def phase_deep_research(profile: dict, scan_results: dict) -> dict:
+def phase_deep_research(profile: dict, scan_results: dict,
+                        parent_context: str = "") -> dict:
     log("Phase 3: Deep research via Claude...")
     findings = scan_results.get("top_findings", [])
     if not findings:
@@ -680,15 +871,17 @@ def phase_deep_research(profile: dict, scan_results: dict) -> dict:
         return {"research": [], "synthesis": ""}
 
     enriched = ollama_enrich_findings(findings, profile)
-        log("No findings from Phase 1, skipping Phase 3")
-        return {"research": [], "cross_connections": ""}
-    priority = scan_results.get("priority_track", "AI/ML")
+    priority = scan_results.get("priority_track", "AI/ML")  # noqa: F841
 
     log("Phase 3b: Claude deep synthesis...")
+    parent_block = (
+        f"\nPrior-run context (UCB1-selected parents):\n{parent_context}\n"
+        if parent_context else ""
+    )
     prompt = f"""You are the deep research phase of a {profile['name']}.
 Tracks: {', '.join(profile['tracks'])}
 Context: {profile['context']}
-
+{parent_block}
 Top findings (each has a local pre-research context note):
 {json.dumps(enriched, indent=2)[:5000]}
 
@@ -763,6 +956,71 @@ Return JSON:
     except Exception:
         log("Judge parse failed")
         return {"staged_actions": [], "summary": "Parse failed", "tonight_score": 0}
+
+# ── Phase 5: Lesson Extraction ────────────────────────────────────────────────
+
+def phase_extract_lessons(judge: dict, run_id: str, agent_name: str) -> list[dict]:
+    """Prompt Claude (Sonnet) to distill structured lessons from the Judge output.
+
+    Returns a list of dicts conforming to:
+        {lesson, domain, confidence, source_run_id, tags[]}
+    These are later stored in the lesson_corpus ChromaDB collection.
+    """
+    log("Phase 5: Extracting structured lessons via Claude...")
+    summary       = judge.get("summary", "")
+    staged        = judge.get("staged_actions", [])
+    tonight_score = judge.get("tonight_score", 0)
+
+    prompt = f"""You are a lesson-extraction system for a nightly AI research agent.
+
+Run ID: {run_id}
+Agent: {agent_name}
+Tonight's score: {tonight_score}/10
+
+Judge summary:
+{summary}
+
+Staged actions (title + description):
+{json.dumps([{{"title": a.get("title", ""), "description": a.get("description", "")}}
+             for a in staged], indent=2)}
+
+Extract 3-7 concise, generalizable lessons from this run. Each lesson should be an
+actionable insight that could improve future runs of this or similar agents.
+
+Return a JSON array only — no prose before or after:
+[
+  {{
+    "lesson": "one-sentence actionable insight",
+    "domain": "category such as: tooling, workflow, research, security, llm-routing",
+    "confidence": 0.85,
+    "source_run_id": "{run_id}",
+    "tags": ["tag1", "tag2"]
+  }}
+]"""
+
+    result = claude_chat(prompt)
+
+    # Prefer a bare JSON array; fall back to object wrapping a list
+    try:
+        start = result.find("[")
+        end   = result.rfind("]")
+        if start != -1 and end != -1:
+            arr = json.loads(result[start:end + 1])
+            if isinstance(arr, list):
+                return arr
+    except Exception:
+        pass
+    try:
+        obj = extract_json(result)
+        for v in obj.values():
+            if isinstance(v, list):
+                return v
+    except Exception:
+        pass
+
+    log("Lesson extraction parse failed — no lessons stored")
+    return []
+
 
 # ── Write Staged Files ────────────────────────────────────────────────────────
 
@@ -867,6 +1125,8 @@ def main():
                         help="Re-run setup for the selected agent")
     parser.add_argument("--list-agents", action="store_true",
                         help="List available agent profiles and exit")
+    parser.add_argument("--disable-ucb1", action="store_true",
+                        help="Fall back to sequential (most-recent-first) context-parent selection")
     args = parser.parse_args()
 
     if args.list_agents:
@@ -880,8 +1140,9 @@ def main():
     profile    = AGENT_PROFILES[agent_name]
     dirs       = get_agent_dirs(agent_name)
     date_str   = datetime.now().strftime("%Y-%m-%d")
+    run_id     = f"{agent_name}_{date_str}_{datetime.now().strftime('%H%M%S')}"
 
-    log(f"=== Dream Cycle [{profile['name']}] — {date_str} ===")
+    log(f"=== Dream Cycle [{profile['name']}] — {date_str} (run={run_id}) ===")
 
     config = load_config()
 
@@ -896,16 +1157,38 @@ def main():
         config    = set_agent_config(config, agent_name, agent_cfg)
         save_config(config)
 
-    log(f"Model: {LOCAL_MODEL} | Repos watched: {len(agent_cfg.get('github_repos', []))}")
+    ucb1_c = float(config.get("global", {}).get("ucb1_c", UCB1_C_DEFAULT))
+    log(f"Model: {LOCAL_MODEL} | Repos watched: {len(agent_cfg.get('github_repos', []))} "
+        f"| UCB1 C={ucb1_c}{' (disabled)' if args.disable_ucb1 else ''}")
 
     seen_cache = load_seen_cache(dirs["seen_cache"])
+
+    # Register this run in ChromaDB before phases start; stats updated after completion
+    register_run_node(run_id, agent_name, date_str)
+
+    # UCB1 context-parent selection (or sequential fallback with --disable-ucb1)
+    parents = select_context_parents(agent_name, k=3,
+                                     disable_ucb1=args.disable_ucb1, C=ucb1_c)
+    parent_context = "\n".join(
+        f"[{p['date_str']} score={p['tonight_score']}/10 "
+        f"track={p['priority_track']}]: {p['summary']}"
+        for p in parents
+    )
 
     scan     = phase_scan(profile, agent_cfg, seen_cache)
     save_seen_cache(dirs["seen_cache"], seen_cache)
 
     reflect  = phase_reflect(profile, dirs)
-    research = phase_deep_research(profile, scan)
+    research = phase_deep_research(profile, scan, parent_context)
     judge    = phase_judge_and_stage(profile, scan, reflect, research)
+
+    # Lesson extraction (Claude/Sonnet) → lesson_corpus ChromaDB collection
+    lessons  = phase_extract_lessons(judge, run_id, agent_name)
+    store_lessons(lessons, agent_name, run_id)
+
+    # Persist final score and summary; cumulative_value accumulates for UCB1
+    update_run_node(run_id, judge.get("tonight_score", 0), judge.get("summary", ""))
+
     manifest = write_staging(judge, date_str, dirs)
     changelog_path = write_changelog(date_str, agent_name, profile,
                                      scan, reflect, research, judge, manifest, dirs)
