@@ -790,6 +790,84 @@ def _run_nodes(chroma):
     )
 
 
+def _agent_memories(chroma):
+    """Per-agent namespace memories — also exposed via the Lumen MCP server."""
+    return chroma.get_or_create_collection(
+        name="agent_memories",
+        metadata={"hnsw:space": "cosine"},
+    )
+
+
+def write_to_agent_namespace(agent_name: str, namespace: str,
+                              judge: dict, scan: dict, run_id: str):
+    """Persist tonight's judge output to the agent's memory namespace.
+
+    The same agent_memories collection is exposed read/write via lumen_mcp_server.py,
+    so anything stored here is immediately queryable by Claude Code through MCP tools.
+    """
+    chroma = get_chroma_client()
+    if chroma is None:
+        log(f"ChromaDB unavailable — skipping namespace write for '{namespace}'")
+        return
+    coll = _agent_memories(chroma)
+
+    content = json.dumps({
+        "run_id":         run_id,
+        "tonight_score":  judge.get("tonight_score", 0),
+        "summary":        judge.get("summary", "")[:500],
+        "priority_track": scan.get("priority_track", ""),
+        "staged_count":   len(judge.get("staged_actions", [])),
+        "date":           datetime.now().strftime("%Y-%m-%d"),
+    })
+    memory_id = f"{namespace}_{run_id}"
+    coll.upsert(
+        ids=[memory_id],
+        documents=[content],
+        metadatas=[{
+            "namespace":  namespace,
+            "agent_name": agent_name,
+            "run_id":     run_id,
+            "tags":       scan.get("priority_track", ""),
+            "created_at": datetime.now().isoformat(),
+        }],
+    )
+    log(f"Namespace '{namespace}': run output written to agent_memories")
+
+
+def consolidate_agent_namespaces(active_namespaces: list[str]) -> dict:
+    """Query all active namespaces and return a cross-namespace summary dict.
+
+    Called after the judge phase so the current agent can be aware of what
+    other agents stored in prior runs.  Returns {} when ChromaDB is unavailable
+    or no namespaces have any entries yet.
+    """
+    chroma = get_chroma_client()
+    if chroma is None or not active_namespaces:
+        return {}
+
+    coll = _agent_memories(chroma)
+    summary: dict[str, list[dict]] = {}
+    for ns in active_namespaces:
+        try:
+            results = coll.get(
+                where={"namespace": ns},
+                include=["documents", "metadatas"],
+            )
+            entries = [
+                {"content": doc, "run_id": meta.get("run_id", ""),
+                 "date": meta.get("created_at", "")[:10]}
+                for doc, meta in zip(
+                    results.get("documents") or [],
+                    results.get("metadatas") or [],
+                )
+            ]
+            # Keep only the five most-recent entries to avoid bloating context
+            summary[ns] = entries[-5:] if entries else []
+        except Exception as exc:
+            log(f"Consolidation: failed to query namespace '{ns}': {exc}")
+    return summary
+
+
 # ── UCB1 scoring ──────────────────────────────────────────────────────────────
 
 def ucb1_score(times_selected: int, cumulative_value: float,
@@ -1768,6 +1846,23 @@ def main():
 
     # Persist final score and summary; cumulative_value accumulates for UCB1
     update_run_node(run_id, judge.get("tonight_score", 0), judge.get("summary", ""))
+
+    # Write tonight's output to the agent's memory namespace (Lumen-readable via MCP)
+    memory_namespace = profile.get("memory_namespace", agent_name)
+    write_to_agent_namespace(agent_name, memory_namespace, judge, scan, run_id)
+
+    # Consolidation pass: query every known active namespace so cross-agent
+    # state is visible in the changelog and available for tomorrow's context.
+    all_namespaces = list({
+        p.get("memory_namespace", n)
+        for n, p in all_profiles.items()
+        if p.get("memory_namespace")
+    })
+    ns_summary = consolidate_agent_namespaces(all_namespaces)
+    if ns_summary:
+        active_ns = [ns for ns, entries in ns_summary.items() if entries]
+        log(f"Namespace consolidation: {len(active_ns)} namespace(s) with data "
+            f"({', '.join(active_ns)})")
 
     # Post-run lesson decay cleanup — not inline with phases (Feature 3)
     selected_run_ids = [p["run_id"] for p in parents]
