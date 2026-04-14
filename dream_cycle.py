@@ -382,6 +382,94 @@ def _validate_mcp_endpoint(url: str, source: str) -> bool:
     return True
 
 
+# Populated by _collect_registry_dirs() on Windows; used by load_agent_manifests()
+# to apply additional scrutiny to registry-sourced paths.
+_REGISTRY_SOURCED_DIRS: set[Path] = set()
+
+# Maximum character length accepted for a registry-supplied path string.
+_MAX_REGISTRY_PATH_LEN = 260  # Windows MAX_PATH
+
+# Only REG_SZ (1) values are accepted from the registry.
+# REG_EXPAND_SZ (2) can embed environment-variable expansions that may
+# point outside any expected directory; we reject it entirely.
+_REG_SZ = 1
+
+
+def _is_safe_registry_path(raw_value: str, reg_type: int,
+                             allowed_roots: list[Path]) -> tuple[bool, str]:
+    """Validate a registry-sourced directory path before treating it as a manifest dir.
+
+    Checks applied (in order):
+      1. Value type is REG_SZ — reject REG_EXPAND_SZ and all other types.
+      2. Value is a string within _MAX_REGISTRY_PATH_LEN characters.
+      3. Value does not start with \\\\ (UNC path — network share).
+      4. Resolved path does not contain '..' components.
+      5. Resolved path is a descendant of at least one allowed_root.
+
+    Returns:
+        (True, "")          — safe to use
+        (False, "<reason>") — rejected; reason is logged by caller
+    """
+    if reg_type != _REG_SZ:
+        return False, f"registry value type {reg_type} rejected (only REG_SZ=1 allowed)"
+    if not isinstance(raw_value, str):
+        return False, "registry value is not a string"
+    if len(raw_value) > _MAX_REGISTRY_PATH_LEN:
+        return False, f"path exceeds {_MAX_REGISTRY_PATH_LEN} chars"
+    if raw_value.startswith("\\\\"):
+        return False, "UNC (network share) paths are not allowed"
+    try:
+        resolved = Path(raw_value).resolve()
+    except Exception as exc:
+        return False, f"path resolution failed: {exc}"
+    if ".." in resolved.parts:
+        return False, "path traversal ('..') detected after resolution"
+    # Must be under at least one allowed root
+    for root in allowed_roots:
+        try:
+            resolved.relative_to(root.resolve())
+            return True, ""
+        except ValueError:
+            continue
+    roots_str = ", ".join(str(r) for r in allowed_roots)
+    return False, f"path '{resolved}' is outside allowed roots ({roots_str})"
+
+
+def _collect_registry_dirs(allowed_roots: list[Path]) -> list[Path]:
+    """Read HKCU\\Software\\DreamCycle\\Agents registry key and return validated paths.
+
+    All paths from the registry are treated as untrusted and passed through
+    _is_safe_registry_path() before being used.  Validated paths are added to
+    _REGISTRY_SOURCED_DIRS so load_agent_manifests() can apply stricter checks.
+    """
+    result: list[Path] = []
+    try:
+        import winreg  # type: ignore[import]
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\DreamCycle\Agents")
+        i = 0
+        while True:
+            try:
+                _vname, raw_value, reg_type = winreg.EnumValue(key, i)
+                ok, reason = _is_safe_registry_path(raw_value, reg_type, allowed_roots)
+                if not ok:
+                    log(f"  [registry-hardening] Rejected registry path "
+                        f"'{str(raw_value)[:60]}': {reason}")
+                    i += 1
+                    continue
+                rpath = Path(raw_value)
+                if rpath.is_dir():
+                    result.append(rpath)
+                    _REGISTRY_SOURCED_DIRS.add(rpath.resolve())
+                    log(f"  [registry-hardening] Accepted registry path (untrusted): {rpath}")
+                i += 1
+            except OSError:
+                break
+        winreg.CloseKey(key)
+    except Exception:
+        pass  # winreg unavailable or key absent — not an error on Linux/macOS
+    return result
+
+
 def get_agent_manifest_dirs() -> list[Path]:
     """Return all valid manifest directories for the current platform.
 
@@ -389,12 +477,13 @@ def get_agent_manifest_dirs() -> list[Path]:
     macOS  : ~/.dream_cycle/agents/
              ~/Library/Application Support/dream_cycle/agents/
     Windows: %APPDATA%/dream_cycle/agents/
-             HKCU\\Software\\DreamCycle\\Agents registry keys (if winreg available)
+             HKCU\\Software\\DreamCycle\\Agents (REG_SZ values only;
+             validated against allowed roots before use — see _is_safe_registry_path)
 
     Only directories that currently exist on disk are returned.
     pathlib.Path is used throughout — no hardcoded separators.
     """
-    system = platform.system()
+    system     = platform.system()
     candidates: list[Path] = []
 
     # Common to all platforms
@@ -408,33 +497,14 @@ def get_agent_manifest_dirs() -> list[Path]:
         appdata = os.environ.get("APPDATA")
         if appdata:
             candidates.append(Path(appdata) / "dream_cycle" / "agents")
-        # Optional: scan HKCU\Software\DreamCycle\Agents for extra paths.
-        # Registry paths are collected here but flagged as untrusted in
-        # load_agent_manifests() — see _REGISTRY_SOURCED_DIRS.
-        try:
-            import winreg  # type: ignore[import]
-            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                                 r"Software\DreamCycle\Agents")
-            i = 0
-            while True:
-                try:
-                    _name, value, _reg_type = winreg.EnumValue(key, i)
-                    rpath = Path(value)
-                    candidates.append(rpath)
-                    _REGISTRY_SOURCED_DIRS.add(rpath.resolve())
-                    i += 1
-                except OSError:
-                    break
-            winreg.CloseKey(key)
-        except Exception:
-            pass  # winreg unavailable or key absent — silent fallback
+        # Registry paths are only accepted when they descend from the user's
+        # home dir or %APPDATA% — prevents elevation to system directories.
+        allowed_roots = [Path.home()]
+        if appdata:
+            allowed_roots.append(Path(appdata))
+        candidates.extend(_collect_registry_dirs(allowed_roots))
 
     return [d for d in candidates if d.is_dir()]
-
-
-# Populated by get_agent_manifest_dirs() on Windows; used by load_agent_manifests()
-# to apply additional scrutiny to registry-sourced paths (Commit 5 hardening).
-_REGISTRY_SOURCED_DIRS: set[Path] = set()
 
 
 def load_agent_manifests() -> dict:
@@ -479,7 +549,14 @@ def load_agent_manifests() -> dict:
                     f"({len(schema_errors)} error(s))")
                 continue
 
-            # ── Step 3: Optional SHA-256 checksum ────────────────────────────
+            # ── Step 3: SHA-256 checksum ──────────────────────────────────────
+            # Registry-sourced manifests MUST include a checksum field — the
+            # registry is an untrusted source and a checksum proves the file
+            # has not been tampered with after the author signed it.
+            if is_registry_path and not manifest.get("checksum"):
+                log(f"  Skipping {manifest_file.name}: registry-sourced manifests "
+                    f"require a 'checksum' field (SHA-256 of file contents)")
+                continue
             if not _validate_manifest_checksum(manifest, manifest_file):
                 log(f"  Skipping {manifest_file.name}: checksum mismatch")
                 continue
