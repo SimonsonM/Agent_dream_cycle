@@ -25,8 +25,8 @@ Inspired by the Dan Simmons *Hyperion Cantos* series and the Reddit post ["My Op
 11:40 PM  Phase 3.5 — EXPERIMENTATION  Qwen 3.5 local    $0.00   ~5 min
 11:45 PM  Phase 4 — JUDGE     Claude Sonnet     ~$0.10  ~10 min
  4:00 AM  BUILD JOB           No LLM            $0.00   ~2 min
-                                                ------
-                                        TOTAL   ~$0.40/night
+                                                 ------
+                                         TOTAL   ~$0.40/night
 ```
 
 **Phase 1 — Scan**
