@@ -1,14 +1,14 @@
 {
-  "id": "example_agent",
+  "id": "example_research",
   "name": "Example Research Agent",
   "version": "1.0.0",
   "type": "research",
-  "memory_namespace": "example",
+  "memory_namespace": "example_research",
   "scan_targets": [
-    "arxiv",
-    "github_trending"
+    "~/research/papers",
+    "~/documents/active_projects",
+    "~/notes"
   ],
-  "active": false,
-  "token_budget": 2000,
-  "mcp_endpoint": ""
+  "active": true,
+  "mcp_endpoint": "stdio"
 }

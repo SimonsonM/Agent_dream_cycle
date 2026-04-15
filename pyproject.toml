@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-dream-cycle"
+version = "1.0.0"
+description = "An autonomous nightly research agent that scans AI research, reflects on its own performance, and stages self-improvements"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Mike Simonson", email = "mike@example.com"}
+]
+keywords = ["ai", "research", "agent", "automation", "self-improvement"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://github.com/SimonsonM/Agent_dream_cycle"
+Documentation = "https://github.com/SimonsonM/Agent_dream_cycle#readme"
+Repository = "https://github.com/SimonsonM/Agent_dream_cycle"
+Issues = "https://github.com/SimonsonM/Agent_dream_cycle/issues"
+
+[project.scripts]
+dream-cycle = "dream_cycle:main"
+dream-cycle-build = "build_job:main"
+dream-cycle-perf-log = "perf_log:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "black",
+    "flake8",
+    "mypy",
+]
+
+[project.dependencies]
+anthropic = ">=0.18.0"
+requests = ">=2.28.0"
+PyYAML = ">=6.0"

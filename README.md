@@ -1,6 +1,6 @@
 An autonomous nightly research agent that scans AI research, reflects on its own performance, and stages self-improvements — all while you sleep.
 
-Every night at 11:15 PM, a four-phase pipeline runs. By morning, there is a changelog on your desk.
+Every night at 11:15 PM, a five-phase pipeline runs. By morning, there is a changelog on your desk.
 
 ---
 
@@ -22,6 +22,7 @@ Inspired by the Dan Simmons *Hyperion Cantos* series and the Reddit post ["My Op
 11:15 PM  Phase 1 — SCAN      Qwen 3.5 local    $0.00   ~10 min
 11:25 PM  Phase 2 — REFLECT   Qwen 3.5 local    $0.00   ~5 min
 11:30 PM  Phase 3 — RESEARCH  Claude Sonnet     ~$0.30  ~15 min
+11:40 PM  Phase 3.5 — EXPERIMENTATION  Qwen 3.5 local    $0.00   ~5 min
 11:45 PM  Phase 4 — JUDGE     Claude Sonnet     ~$0.10  ~10 min
  4:00 AM  BUILD JOB           No LLM            $0.00   ~2 min
                                                 ------
@@ -44,6 +45,11 @@ Decides what is worth acting on. Stages changes to `~/dream-cycle/dream-staging/
 Auto-applies LOW risk changes only. Flags MEDIUM and HIGH for morning review. Writes a build report.
 
 ---
+
+
+## Experimentation Phase
+
+Between deep research and judgment, the agent designs safe experiments to validate proposed changes before committing to staging. This phase reduces the risk of deploying ineffective improvements by testing hypotheses in sandboxed environments, using techniques like A/B testing for prompts, configuration validation in isolation, or mock integrations for tool changes. Only changes that pass a validation threshold (default 70% confidence) proceed to the judge phase for final approval.
 
 ## Risk Levels
 

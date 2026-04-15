@@ -16,7 +16,7 @@ pip install anthropic requests --break-system-packages --quiet
 # ── Directories ────────────────────────────────────────────────────────────────
 echo "[2/4] Creating directories..."
 mkdir -p "$HOME/dream-logs"
-for agent in security marketing programming ai_research; do
+for agent in security marketing programming ai_research mcp; do
     mkdir -p "$HOME/dream-cycle/$agent/staging/applied"
     mkdir -p "$HOME/dream-cycle/$agent/logs"
 done
