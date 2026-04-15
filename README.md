@@ -19,15 +19,14 @@ Inspired by the Dan Simmons *Hyperion Cantos* series and the Reddit post ["My Op
 ## Architecture
 
 ```
-11:15 PM  Phase 1 — SCAN      Qwen 3.5 local    $0.00   ~10 min
-11:25 PM  Phase 2 — REFLECT   Qwen 3.5 local    $0.00   ~5 min
-11:30 PM  Phase 3 — RESEARCH  Claude Sonnet     ~$0.30  ~15 min
-11:40 PM  Phase 3.5 — EXPERIMENTATION  Qwen 3.5 local    $0.00   ~5 min
-11:45 PM  Phase 4 — JUDGE     Claude Sonnet     ~$0.10  ~10 min
- 4:00 AM  BUILD JOB           No LLM            $0.00   ~2 min
-                                                 ------
-                                         TOTAL   ~$0.40/night
+11:15 PM  Phase 1 — SCAN      
+11:25 PM  Phase 2 — REFLECT   
+11:30 PM  Phase 3 — RESEARCH 
+11:40 PM  Phase 4— EXPERIMENTATION  
+11:45 PM  Phase 5 — JUDGE    
+ 4:00 AM  BUILD JOB  
 ```
+
 
 **Phase 1 — Scan**
 Pulls from arXiv (AI/ML, CV, Security), GitHub Trending, and the NVD CVE feed. Scores each finding across your configured research tracks. Autonomously decides tonight's priority track based on what is freshest and most actionable.
@@ -38,7 +37,9 @@ Reviews today's agent performance log. Identifies patterns in task failures, mod
 **Phase 3 — Deep Research**
 Takes the top 5 findings and goes deep using Claude Sonnet. Reads iteratively — a finding that builds on another finding gets followed further. Cross-references against your current stack and active projects.
 
-**Phase 4 — Judge and Stage**
+**Phase 4 — Experimentation
+
+**Phase 5 — Judge and Stage**
 Decides what is worth acting on. Stages changes to `~/dream-cycle/dream-staging/` by risk level. Writes a rollback script for every staged action. Nothing touches live config directly.
 
 **4 AM Build Job**
