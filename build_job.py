@@ -20,6 +20,36 @@ from pathlib import Path
 BASE_DIR = Path.home() / "dream-cycle"
 LOGS_DIR = Path.home() / "dream-logs"
 
+# Paths that build_job is permitted to write into.  LLM-generated file_path
+# values are validated against this allowlist before any write occurs.
+ALLOWED_WRITE_DIRS = [
+    BASE_DIR,
+    LOGS_DIR,
+    Path.home() / "dream-logs",
+]
+
+
+def _safe_target(file_path: str) -> Path | None:
+    """Return a resolved Path only if it falls inside an allowed directory.
+
+    Returns None and logs a warning when the path resolves outside the
+    allowlist — prevents a prompt-injected path (e.g. ~/.ssh/authorized_keys)
+    from being written by the build job.
+    """
+    try:
+        target = Path(file_path).expanduser().resolve()
+    except Exception as e:
+        log(f"    Path resolution failed for '{file_path}': {e}")
+        return None
+    for allowed in ALLOWED_WRITE_DIRS:
+        try:
+            target.relative_to(allowed.resolve())
+            return target
+        except ValueError:
+            continue
+    log(f"    BLOCKED: '{target}' is outside allowed write directories")
+    return None
+
 
 def discover_agent_names() -> list[str]:
     """Return agent names by scanning BASE_DIR for subdirs that have a staging dir.
@@ -39,7 +69,26 @@ def log(msg: str):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
-def apply_action(action: dict, staged_file: Path, applied_dir: Path) -> bool:
+def _write_applied_record(agent_name: str, event: str, title: str,
+                           action_type: str, file_path: str, rollback_path: str):
+    """Append one line to <agent>/logs/applied_changes.jsonl for reflection feedback."""
+    import json
+    log_path = BASE_DIR / agent_name / "logs" / "applied_changes.jsonl"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "timestamp":    datetime.now().isoformat(),
+        "event":        event,          # "applied" | "reverted"
+        "title":        title,
+        "action_type":  action_type,
+        "file_path":    file_path,
+        "rollback_path": rollback_path,
+    }
+    with open(log_path, "a") as f:
+        f.write(json.dumps(record) + "\n")
+
+
+def apply_action(action: dict, staged_file: Path, applied_dir: Path,
+                 agent_name: str = "") -> bool:
     action_type  = action.get("action_type", "")
     content      = action.get("content", "")
     file_path    = action.get("file_path", "")
@@ -53,14 +102,15 @@ def apply_action(action: dict, staged_file: Path, applied_dir: Path) -> bool:
             model_name = shlex.split(content)[-1]
             result = subprocess.run(shlex.split(content),
                                     capture_output=True, text=True, timeout=300)
-            result = subprocess.run(shlex.split(content), capture_output=True, text=True, timeout=300)
             if result.returncode != 0:
                 log(f"    Model pull failed: {result.stderr}")
                 return False
             log(f"    Pulled model: {model_name}")
 
         elif action_type in ("documentation", "config") and file_path and content:
-            target = Path(file_path).expanduser()
+            target = _safe_target(file_path)
+            if target is None:
+                return False
             target.parent.mkdir(parents=True, exist_ok=True)
             if target.exists():
                 shutil.copy2(target, str(target) + ".bak")
@@ -69,7 +119,9 @@ def apply_action(action: dict, staged_file: Path, applied_dir: Path) -> bool:
             log(f"    Written: {target}")
 
         elif action_type == "script" and file_path and content:
-            target = Path(file_path).expanduser()
+            target = _safe_target(file_path)
+            if target is None:
+                return False
             target.parent.mkdir(parents=True, exist_ok=True)
             with open(target, "w") as f:
                 f.write(content)
@@ -83,6 +135,7 @@ def apply_action(action: dict, staged_file: Path, applied_dir: Path) -> bool:
         ts            = datetime.now().strftime("%Y%m%d_%H%M%S")
         safe_title    = title[:30].replace(" ", "_")
         rollback_path = applied_dir / f"rollback_{ts}_{safe_title}.sh"
+        applied_log   = str(BASE_DIR / agent_name / "logs" / "applied_changes.jsonl") if agent_name else ""
         with open(rollback_path, "w") as f:
             f.write("#!/bin/bash\n")
             f.write(f"# Rollback: {title}\n")
@@ -98,8 +151,24 @@ def apply_action(action: dict, staged_file: Path, applied_dir: Path) -> bool:
                     f.write(f"echo 'Manual rollback required for: {title}'\n")
             else:
                 f.write(f"echo 'Manual rollback required for: {title}'\n")
+            # Append a revert record to applied_changes.jsonl so Phase 2 sees it
+            if applied_log:
+                f.write(
+                    f'\npython3 -c "'
+                    f"import json, datetime; "
+                    f"open('{applied_log}', 'a').write("
+                    f"json.dumps({{'timestamp': datetime.datetime.now().isoformat(), "
+                    f"'event': 'reverted', 'title': '{title.replace(chr(39), '')}', "
+                    f"'action_type': '{action_type}', 'file_path': '{file_path}', "
+                    f"'rollback_path': '{rollback_path}'}}) + '\\\\n')\"\n"
+                )
         os.chmod(rollback_path, 0o755)
         log(f"    Rollback: {rollback_path.name}")
+
+        # Record successful apply for Phase 2 feedback loop
+        if agent_name:
+            _write_applied_record(agent_name, "applied", title,
+                                  action_type, file_path, str(rollback_path))
 
         shutil.move(str(staged_file), str(applied_dir / staged_file.name))
         return True
@@ -141,7 +210,7 @@ def run_agent_build(agent_name: str, date_str: str) -> tuple[list, list]:
             action = json.load(f)
 
         if risk == "low":
-            if apply_action(action, staged_file, applied_dir):
+            if apply_action(action, staged_file, applied_dir, agent_name=agent_name):
                 applied.append(entry["title"])
         else:
             review_needed.append({"risk": risk, "title": entry["title"],

@@ -37,20 +37,14 @@ Reviews today's agent performance log. Identifies patterns in task failures, mod
 **Phase 3 — Deep Research**
 Takes the top 5 findings and goes deep using Claude Sonnet. Reads iteratively — a finding that builds on another finding gets followed further. Cross-references against your current stack and active projects.
 
-**Phase 4 — Experimentation
+**Phase 3.5 — Experimentation**
+Validates proposed changes through safe experimentation (e.g., A/B testing for prompts, sandboxed configuration validation, mock integrations) before committing to staging. Only changes that pass a validation threshold proceed to the Judge phase.
 
-**Phase 5 — Judge and Stage**
+**Phase 4 — Judge and Stage**
 Decides what is worth acting on. Stages changes to `~/dream-cycle/dream-staging/` by risk level. Writes a rollback script for every staged action. Nothing touches live config directly.
 
 **4 AM Build Job**
 Auto-applies LOW risk changes only. Flags MEDIUM and HIGH for morning review. Writes a build report.
-
----
-
-
-## Experimentation Phase
-
-Between deep research and judgment, the agent designs safe experiments to validate proposed changes before committing to staging. This phase reduces the risk of deploying ineffective improvements by testing hypotheses in sandboxed environments, using techniques like A/B testing for prompts, configuration validation in isolation, or mock integrations for tool changes. Only changes that pass a validation threshold (default 70% confidence) proceed to the judge phase for final approval.
 
 ## Risk Levels
 

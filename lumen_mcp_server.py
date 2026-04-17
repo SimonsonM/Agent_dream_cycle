@@ -50,7 +50,7 @@ import re
 import secrets
 import sys
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 # ── ChromaDB ──────────────────────────────────────────────────────────────────
@@ -217,7 +217,7 @@ def add_memory(content: str, namespace: str,
         metadatas=[{
             "namespace":  namespace,
             "tags":       ",".join(tags),
-            "created_at": datetime.utcnow().isoformat(),
+            "created_at": datetime.now(timezone.utc).isoformat(),
         }],
     )
     return {"id": memory_id, "namespace": namespace}

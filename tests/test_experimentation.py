@@ -8,7 +8,8 @@ from unittest.mock import patch, MagicMock
 
 # Add the project root to the path so we can import dream_cycle
 import sys
-sys.path.insert(0, '/home/mike/Agent_dream_cycle')
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from dream_cycle import (
     phase_experimentation, 

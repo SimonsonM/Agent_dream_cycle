@@ -106,6 +106,12 @@ def load_and_validate_config(config_path: str) -> Dict[str, AgentProfileConfig]:
             config = json.load(f)
     elif config_file.suffix.lower() in ['.yaml', '.yml']:
         try:
+            import yaml
+        except ImportError:
+            raise ImportError(
+                "pyyaml is required to load YAML config files: pip install pyyaml"
+            )
+        try:
             with open(config_file, 'r') as f:
                 config = yaml.safe_load(f)
         except yaml.YAMLError as e:

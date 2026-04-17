@@ -14,11 +14,15 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
+import tempfile
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlparse
 import platform
 
 import anthropic
@@ -38,7 +42,232 @@ try:
 except ImportError:
     YAML_AVAILABLE = False
 
+try:
+    from plugin_system import PluginManager
+    PLUGINS_AVAILABLE = True
+except ImportError:
+    PLUGINS_AVAILABLE = False
+
+try:
+    import jsonschema
+    JSONSCHEMA_AVAILABLE = True
+except ImportError:
+    JSONSCHEMA_AVAILABLE = False
+
 import random
+
+# ── Injection-defense ─────────────────────────────────────────────────────────
+
+_INJECTION_PATTERNS: list[re.Pattern] = [
+    # XML/SGML role tags
+    re.compile(r"<\s*/?\s*(system|user|assistant|human|ai|inst|s)\s*>", re.IGNORECASE),
+    re.compile(r"<\s*!\s*--.*?--\s*>", re.DOTALL),
+    # LLaMA / Mistral / Qwen chat-template tokens
+    re.compile(r"\[INST\]|\[/INST\]|\[SYS\]|\[/SYS\]", re.IGNORECASE),
+    re.compile(r"<<SYS>>|<</SYS>>", re.IGNORECASE),
+    re.compile(r"<\|im_start\|>|<\|im_end\|>", re.IGNORECASE),
+    re.compile(r"<\|system\|>|<\|user\|>|<\|assistant\|>", re.IGNORECASE),
+    re.compile(r"<\|.*?\|>"),
+    # Bracket / brace role markers
+    re.compile(r"\[\s*(system|user|assistant|human|ai|prompt|context)\s*\]", re.IGNORECASE),
+    re.compile(r"\{\s*(system|user|assistant|human|ai|prompt|context)\s*\}", re.IGNORECASE),
+    # Jailbreak preambles
+    re.compile(r"ignore\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?|rules?)", re.IGNORECASE),
+    re.compile(r"disregard\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?|rules?)", re.IGNORECASE),
+    re.compile(r"forget\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?|rules?)", re.IGNORECASE),
+    re.compile(r"you\s+are\s+now\s+(a|an|the)\s+\w+", re.IGNORECASE),
+    re.compile(r"act\s+as\s+(a|an|the)\s+\w+", re.IGNORECASE),
+    re.compile(r"pretend\s+(you\s+are|to\s+be)\s+(a|an|the)", re.IGNORECASE),
+    re.compile(r"\bdo\s+anything\s+now\b", re.IGNORECASE),
+    re.compile(r"\bjailbreak\b", re.IGNORECASE),
+    re.compile(r"\bdan\s+mode\b", re.IGNORECASE),
+    re.compile(r"\bdeveloper\s+mode\b", re.IGNORECASE),
+    # Prompt-section separators
+    re.compile(r"###\s*(system|user|assistant|instruction)", re.IGNORECASE),
+    re.compile(r"---\s*(system|user|assistant|instruction)", re.IGNORECASE),
+    re.compile(r"===\s*(system|user|assistant|instruction)", re.IGNORECASE),
+    # Override / injection tags
+    re.compile(r"<\/?(prompt|context|instruction|override)>", re.IGNORECASE),
+    re.compile(r"\bsystem\s+prompt\b", re.IGNORECASE),
+    re.compile(r"\boverride\s+(instructions?|system)\b", re.IGNORECASE),
+    # Template injection
+    re.compile(r"\{\{.*?\}\}"),
+    re.compile(r"%\{.*?\}%"),
+]
+
+
+def sanitize_llm_input(text: str, token_budget: int = 2000) -> str:
+    """Strip prompt-injection patterns from external text before it enters a prompt.
+
+    Applied to all externally-sourced content (arXiv abstracts, GitHub descriptions,
+    CVE text) before embedding in any Qwen or Claude prompt.  Each call is capped at
+    token_budget * 4 characters (default 8 000).
+    """
+    if not isinstance(text, str):
+        return str(text)
+    char_budget = min(token_budget * 4, 8000)
+    cleaned = text
+    hit = False
+    for pattern in _INJECTION_PATTERNS:
+        new = pattern.sub("", cleaned)
+        if new != cleaned:
+            hit = True
+            cleaned = new
+    if hit:
+        print(f"[injection-defense] Stripped injection pattern(s) from input", flush=True)
+    return cleaned[:char_budget].strip()
+
+
+def sanitize_item(item: dict, token_budget: int = 2000) -> dict:
+    """Sanitize all string fields in a data-item dict in-place."""
+    return {
+        k: (sanitize_llm_input(v, token_budget) if isinstance(v, str)
+            else [sanitize_llm_input(e, token_budget) if isinstance(e, str) else e
+                  for e in v] if isinstance(v, list)
+            else v)
+        for k, v in item.items()
+    }
+
+
+# ── Namespace isolation ────────────────────────────────────────────────────────
+
+_SAFE_NS_RE = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
+
+
+def _enforce_namespace(namespace: str) -> str:
+    """Validate *namespace*; raise ValueError if it fails the safe-identifier check.
+
+    Must be called before every ChromaDB write that tags an entry with a namespace.
+    """
+    if not isinstance(namespace, str) or not _SAFE_NS_RE.match(namespace):
+        raise ValueError(
+            f"[namespace-isolation] Invalid namespace '{namespace}'. "
+            r"Must match ^[a-z][a-z0-9_]{0,62}$"
+        )
+    return namespace
+
+
+def _check_namespace_entry_integrity(
+    entry_id: str,
+    metadata: dict,
+    expected_namespace: str,
+) -> bool:
+    """Return True only if a ChromaDB entry passes all integrity checks.
+
+    Checks:
+      1. Stored namespace tag matches the queried namespace.
+      2. run_id / source_run_id contains no path-traversal characters.
+      3. tonight_score, when present, is numeric and in [0, 10].
+
+    Flagged entries are logged with the [namespace-isolation] FLAGGED prefix and
+    excluded from retrieval — never silently merged.
+    """
+    stored_ns = metadata.get("namespace") or metadata.get("agent_name", "")
+    if stored_ns and stored_ns != expected_namespace:
+        print(
+            f"[namespace-isolation] FLAGGED: entry '{entry_id}' has namespace "
+            f"'{stored_ns}' but expected '{expected_namespace}' — excluded",
+            flush=True,
+        )
+        return False
+
+    run_id = str(metadata.get("source_run_id") or metadata.get("run_id") or entry_id)
+    if any(c in run_id for c in ("/", "\\", "..", "\x00")):
+        print(
+            f"[namespace-isolation] FLAGGED: entry '{entry_id}' has unsafe "
+            f"run_id '{run_id}' — excluded",
+            flush=True,
+        )
+        return False
+
+    score = metadata.get("tonight_score")
+    if score is not None:
+        try:
+            if not (0.0 <= float(score) <= 10.0):
+                raise ValueError
+        except (TypeError, ValueError):
+            print(
+                f"[namespace-isolation] FLAGGED: entry '{entry_id}' has invalid "
+                f"tonight_score '{score}' — excluded",
+                flush=True,
+            )
+            return False
+
+    return True
+
+
+# ── Manifest validation ────────────────────────────────────────────────────────
+
+MANIFEST_JSON_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "id":               {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,62}$"},
+        "name":             {"type": "string", "minLength": 1, "maxLength": 100},
+        "version":          {"type": "string"},
+        "type":             {"type": "string",
+                             "enum": ["research", "security", "marketing",
+                                      "programming", "mcp"]},
+        "memory_namespace": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,62}$"},
+        "scan_targets":     {
+            "type": "array",
+            "items": {"type": "string",
+                      "enum": ["arxiv", "github_trending", "cves", "github_releases"]},
+            "minItems": 1,
+        },
+        "active":           {"type": "boolean"},
+        "mcp_endpoint":     {"type": "string"},
+        "checksum":         {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "token_budget":     {"type": "integer", "minimum": 100, "maximum": 8000},
+    },
+    "required": ["id", "name", "version", "type", "memory_namespace",
+                 "scan_targets", "active"],
+    "additionalProperties": False,
+}
+
+
+def _validate_mcp_endpoint(endpoint: str) -> bool:
+    """Return True only if endpoint is empty or an http(s) URL with a non-empty host.
+
+    Rejects: file://, javascript:, data:, bare paths, empty hosts.
+    """
+    if not endpoint:
+        return True
+    try:
+        parsed = urlparse(endpoint)
+        if parsed.scheme not in ("http", "https"):
+            print(
+                f"[manifest-validation] Rejected mcp_endpoint scheme "
+                f"'{parsed.scheme}': {endpoint}",
+                flush=True,
+            )
+            return False
+        if not parsed.hostname:
+            print(
+                f"[manifest-validation] Rejected mcp_endpoint with empty host: {endpoint}",
+                flush=True,
+            )
+            return False
+        return True
+    except Exception as exc:
+        print(f"[manifest-validation] mcp_endpoint parse error: {exc}", flush=True)
+        return False
+
+
+def _verify_manifest_checksum(manifest_file: Path, manifest: dict) -> bool:
+    """Return True if no checksum field is present, or if SHA-256 matches the file."""
+    checksum = manifest.get("checksum", "")
+    if not checksum:
+        return True
+    actual = hashlib.sha256(manifest_file.read_bytes()).hexdigest()
+    if actual != checksum:
+        print(
+            f"[manifest-validation] Checksum mismatch for {manifest_file.name}: "
+            f"expected {checksum}, got {actual}",
+            flush=True,
+        )
+        return False
+    return True
+
 
 # ── Agent Manifest Discovery ────────────────────────────────────────────────
 def get_agent_manifest_dirs() -> list[Path]:
@@ -64,29 +293,71 @@ def get_agent_manifest_dirs() -> list[Path]:
     return [d for d in dirs if d.exists() and d.is_dir()]
 
 def load_agent_manifests() -> dict:
-    """Load all valid agent manifests from manifest directories."""
-    agents = {}
+    """Load and validate all agent manifests through the six-stage pipeline.
+
+    Stage 1 — JSON parse
+    Stage 2 — JSON Schema (additionalProperties: false, closed enum for scan_targets)
+    Stage 3 — SHA-256 checksum (verified when 'checksum' field is present)
+    Stage 4 — mcp_endpoint allow-list (http/https with non-empty host only)
+    Stage 5 — active flag (inactive manifests skipped silently)
+    Stage 6 — duplicate ID guard (first ID wins; collisions logged)
+
+    All failures are non-fatal: bad manifests are logged and skipped.
+    """
+    agents: dict = {}
     manifest_dirs = get_agent_manifest_dirs()
-    
+
     for manifest_dir in manifest_dirs:
         for manifest_file in manifest_dir.glob("*.json"):
+            # Stage 1 — JSON parse
             try:
                 with open(manifest_file) as f:
                     manifest = json.load(f)
-                
-                # Validate required fields
-                required_fields = ["id", "name", "version", "type", "memory_namespace", "scan_targets", "active"]
-                if not all(field in manifest for field in required_fields):
-                    continue
-                    
-                if not manifest["active"]:
-                    continue
-                    
-                agents[manifest["id"]] = manifest
-            except (json.JSONDecodeError, IOError):
-                # Skip invalid manifest files
+            except (json.JSONDecodeError, IOError) as exc:
+                print(f"[manifest-validation] {manifest_file.name}: JSON parse failed — {exc}",
+                      flush=True)
                 continue
-    
+
+            # Stage 2 — JSON Schema
+            if JSONSCHEMA_AVAILABLE:
+                try:
+                    jsonschema.validate(instance=manifest, schema=MANIFEST_JSON_SCHEMA)
+                except jsonschema.ValidationError as exc:
+                    print(f"[manifest-validation] {manifest_file.name}: schema error — {exc.message}",
+                          flush=True)
+                    continue
+            else:
+                # Fallback: check required fields manually
+                required = ["id", "name", "version", "type", "memory_namespace",
+                            "scan_targets", "active"]
+                missing = [f for f in required if f not in manifest]
+                if missing:
+                    print(f"[manifest-validation] {manifest_file.name}: missing fields {missing}",
+                          flush=True)
+                    continue
+
+            # Stage 3 — Checksum
+            if not _verify_manifest_checksum(manifest_file, manifest):
+                continue
+
+            # Stage 4 — mcp_endpoint allow-list
+            if not _validate_mcp_endpoint(manifest.get("mcp_endpoint", "")):
+                continue
+
+            # Stage 5 — active flag
+            if not manifest.get("active", False):
+                continue
+
+            # Stage 6 — duplicate ID guard
+            agent_id = manifest["id"]
+            if agent_id in agents:
+                print(f"[manifest-validation] Duplicate agent id '{agent_id}' in "
+                      f"{manifest_file.name} — first registration wins, skipping",
+                      flush=True)
+                continue
+
+            agents[agent_id] = manifest
+
     return agents
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
@@ -126,6 +397,7 @@ AGENT_PROFILES = {
         ],
         "fetch_cves": True,
         "fetch_github_trending": False,
+        "github_trending_query": "security vulnerability exploit CVE detection",
         "context": (
             "Focus on exploitability, CVE severity, defensive tooling, "
             "and threat actor TTPs. Cross-reference MITRE ATT&CK where applicable."
@@ -151,6 +423,7 @@ AGENT_PROFILES = {
         ],
         "fetch_cves": False,
         "fetch_github_trending": False,
+        "github_trending_query": "marketing analytics growth SEO conversion",
         "context": (
             "Focus on conversion rate impact, SEO ranking signals, "
             "content distribution leverage, and MarTech integrations "
@@ -179,6 +452,7 @@ AGENT_PROFILES = {
         ],
         "fetch_cves": False,
         "fetch_github_trending": True,
+        "github_trending_query": "model context protocol MCP agent memory tool",
         "context": (
             "Focus on MCP specification implementations, agent memory systems, "
             "context protocol innovations, and tool integration patterns. "
@@ -205,6 +479,7 @@ AGENT_PROFILES = {
         ],
         "fetch_cves": False,
         "fetch_github_trending": True,
+        "github_trending_query": "developer tooling language runtime devops infrastructure",
         "context": (
             "Focus on language runtime changes, breaking API changes, "
             "new tooling that replaces existing workflow steps, and "
@@ -233,6 +508,7 @@ AGENT_PROFILES = {
         ],
         "fetch_cves": False,
         "fetch_github_trending": True,
+        "github_trending_query": "AI machine learning LLM agent transformer",
         "context": (
             "Focus on benchmark improvements, architectural innovations, "
             "training efficiency breakthroughs, and safety implications. "
@@ -350,71 +626,6 @@ def select_local_model() -> str:
         return model_name
     return "qwen2.5:7b"
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
-
-def log(msg: str):
-    ts = datetime.now().strftime("%H:%M:%S")
-    print(f"[{ts}] {msg}", flush=True)
-
-def extract_json(text: str) -> dict:
-    """Extract the first valid JSON object from an LLM response."""
-    decoder = json.JSONDecoder()
-    for i, ch in enumerate(text):
-        if ch == '{':
-            try:
-                obj, _ = decoder.raw_decode(text, i)
-                return obj
-            except json.JSONDecodeError:
-                continue
-    raise ValueError("No JSON object found in response")
-
-def ollama_chat(prompt: str, system: str = "") -> str:
-    payload = {
-        "model": LOCAL_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "stream": False,
-    }
-    if system:
-        payload["messages"].insert(0, {"role": "system", "content": system})
-    try:
-        r = requests.get("http://localhost:11434/api/tags", timeout=10)
-        r.raise_for_status()
-        return [m["name"] for m in r.json().get("models", [])]
-    except Exception:
-        return []
-
-def pull_ollama_model(model_name: str) -> bool:
-    print(f"Pulling {model_name} (this may take a while)...")
-    try:
-        result = subprocess.run(["ollama", "pull", model_name], timeout=600)
-        return result.returncode == 0
-    except Exception as e:
-        print(f"Pull failed: {e}")
-        return False
-
-def select_local_model() -> str:
-    print("\n── Local Model Selection ──────────────────────────────────────")
-    available = list_ollama_models()
-    options   = available + ["Pull a different model"]
-    for i, opt in enumerate(options, 1):
-        print(f"  {i}. {opt}")
-    print()
-    while True:
-        try:
-            idx = int(input(f"Select [1-{len(options)}]: ").strip()) - 1
-            if 0 <= idx < len(available):
-                return available[idx]
-            elif idx == len(available):
-                break
-            print(f"  Enter a number between 1 and {len(options)}")
-        except (ValueError, EOFError):
-            print("  Enter a number")
-    name = input("Model name to pull (e.g. qwen2.5:7b): ").strip()
-    if name:
-        pull_ollama_model(name)
-        return name
-    return "qwen2.5:7b"
-
 # ── Agent setup ───────────────────────────────────────────────────────────────
 
 def configure_agent(agent_name: str, profile: dict) -> dict:
@@ -466,7 +677,7 @@ def filter_seen(items: list[dict], cache: dict) -> list[dict]:
         ts = cache.get(h)
         if ts is None or ts < cutoff:
             fresh.append(item)
-        cache.setdefault(h, now)
+            cache[h] = now   # stamp/refresh so it won't be re-fetched next night
     skipped = len(items) - len(fresh)
     if skipped:
         log(f"  Dedup cache: skipped {skipped} already-seen items")
@@ -494,6 +705,14 @@ def top_k_items(items: list[dict], tracks: list[str], k: int = 40) -> list[dict]
     return scored[:k]
 
 # ── Data fetchers ─────────────────────────────────────────────────────────────
+
+def _github_headers() -> dict:
+    """Return GitHub API headers, including auth token if GITHUB_TOKEN is set."""
+    headers = {"Accept": "application/vnd.github.v3+json"}
+    token = os.getenv("GITHUB_TOKEN", "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
 
 def fetch_arxiv(query: str, max_results: int = 10) -> list[dict]:
     try:
@@ -566,15 +785,15 @@ def fetch_arxiv_by_categories(
         all_items.extend(items)
     return all_items
 
-def fetch_github_trending() -> list[dict]:
+def fetch_github_trending(query: str = "ai agent machine-learning") -> list[dict]:
     try:
         r = requests.get(
             "https://api.github.com/search/repositories",
-            params={"q": "ai agent machine-learning", "sort": "stars",
-                    "order": "desc", "per_page": 10},
-            headers={"Accept": "application/vnd.github.v3+json"},
+            params={"q": query, "sort": "stars", "order": "desc", "per_page": 10},
+            headers=_github_headers(),
             timeout=30,
         )
+        r.raise_for_status()
         return [{
             "title":   x["full_name"],
             "summary": x.get("description", ""),
@@ -593,7 +812,7 @@ def fetch_github_releases(repos: list[str]) -> list[dict]:
             r = requests.get(
                 f"https://api.github.com/repos/{repo}/releases",
                 params={"per_page": 2},
-                headers={"Accept": "application/vnd.github.v3+json"},
+                headers=_github_headers(),
                 timeout=15,
             )
             if r.status_code == 200:
@@ -637,6 +856,21 @@ def load_perf_log(perf_log_path: Path) -> list[dict]:
                 pass
     return entries[-50:]
 
+
+def load_applied_log(dirs: dict) -> list[dict]:
+    """Load the applied_changes.jsonl written by build_job.py for this agent."""
+    log_path = dirs["logs_dir"] / "applied_changes.jsonl"
+    if not log_path.exists():
+        return []
+    entries = []
+    with open(log_path) as f:
+        for line in f:
+            try:
+                entries.append(json.loads(line))
+            except Exception:
+                pass
+    return entries[-20:]
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def log(msg: str):
@@ -653,18 +887,25 @@ def extract_json(text: str) -> dict:
                 continue
     raise ValueError("No JSON object found in response")
 
-def ollama_chat(prompt: str, system: str = "") -> str:
+def ollama_chat(prompt: str, system: str = "",
+                _retries: int = 3, _retry_delay: float = 10.0) -> str:
     payload = {"model": LOCAL_MODEL,
                "messages": [{"role": "user", "content": prompt}], "stream": False}
     if system:
         payload["messages"].insert(0, {"role": "system", "content": system})
-    try:
-        r = requests.post("http://localhost:11434/api/chat", json=payload, timeout=120)
-        r.raise_for_status()
-        return r.json()["message"]["content"]
-    except Exception as e:
-        log(f"Ollama error: {e}")
-        return ""
+    last_err: Exception | None = None
+    for attempt in range(_retries):
+        try:
+            r = requests.post("http://localhost:11434/api/chat", json=payload, timeout=120)
+            r.raise_for_status()
+            return r.json()["message"]["content"]
+        except Exception as e:
+            last_err = e
+            if attempt < _retries - 1:
+                log(f"Ollama error (attempt {attempt + 1}/{_retries}): {e} — retrying in {_retry_delay}s")
+                time.sleep(_retry_delay)
+    log(f"Ollama failed after {_retries} attempts: {last_err}")
+    return ""
 
 def claude_chat(prompt: str, system: str = "") -> str:
     kwargs = {"model": CLAUDE_MODEL, "max_tokens": 4096,
@@ -835,8 +1076,15 @@ def select_context_parents(agent_name: str, k: int = 3,
     if not ids:
         return []
 
-    node_map = {rid: (doc, meta) for rid, doc, meta in zip(ids, docs, metas)}
-    total    = len(ids)
+    # Integrity check — exclude entries that fail namespace or score validation
+    node_map = {
+        rid: (doc, meta)
+        for rid, doc, meta in zip(ids, docs, metas)
+        if _check_namespace_entry_integrity(rid, meta, agent_name)
+    }
+    if not node_map:
+        return []
+    total    = len(node_map)
 
     if disable_ucb1:
         ordered = sorted(node_map.items(),
@@ -906,6 +1154,11 @@ def select_context_parents(agent_name: str, k: int = 3,
 def register_run_node(run_id: str, agent_name: str, date_str: str,
                       priority_track: str = ""):
     """Insert a skeleton run node before phases execute (stats start at zero)."""
+    try:
+        _enforce_namespace(agent_name)
+    except ValueError as exc:
+        log(str(exc))
+        return
     chroma = get_chroma_client()
     if chroma is None:
         return
@@ -914,6 +1167,7 @@ def register_run_node(run_id: str, agent_name: str, date_str: str,
         documents=[""],
         metadatas=[{
             "agent_name":       agent_name,
+            "namespace_owner":  agent_name,
             "date_str":         date_str,
             "priority_track":   priority_track,
             "times_selected":   0,
@@ -953,6 +1207,11 @@ def store_lessons(lessons: list[dict], agent_name: str, run_id: str):
     """
     if not lessons:
         return
+    try:
+        _enforce_namespace(agent_name)
+    except ValueError as exc:
+        log(str(exc))
+        return
     chroma = get_chroma_client()
     if chroma is None:
         log("ChromaDB unavailable — lessons not persisted")
@@ -973,12 +1232,13 @@ def store_lessons(lessons: list[dict], agent_name: str, run_id: str):
             "source_run_id":         str(lesson.get("source_run_id", run_id)),
             "tags":                  ",".join(tags) if isinstance(tags, list) else str(tags),
             "agent_name":            agent_name,
+            "namespace_owner":       agent_name,   # provenance — enforced at write
             # ── contradiction metadata (Feature 2) ────────────────────────
             "contradiction":         bool(lesson.get("contradiction", False)),
             "conflicting_lesson_id": str(lesson.get("conflicting_lesson_id") or ""),
             "recommendation":        str(lesson.get("recommendation", "coexist")),
             # ── decay fields (Feature 3) ──────────────────────────────────
-            "confidence_decay":      confidence,   # starts equal to base confidence
+            "confidence_decay":      confidence,
             "selection_count":       0,
             "last_selected_run":     "",
             "dormant":               False,
@@ -1258,7 +1518,10 @@ def phase_scan(profile: dict, agent_cfg: dict, seen_cache: dict,
         all_items.extend(cat_items)
 
     if profile.get("fetch_github_trending"):
-        all_items.extend(fetch_github_trending())
+        trending_query = profile.get(
+            "github_trending_query", "ai agent machine-learning"
+        )
+        all_items.extend(fetch_github_trending(trending_query))
 
     if profile.get("fetch_cves"):
         all_items.extend(fetch_cve_recent())
@@ -1273,13 +1536,17 @@ def phase_scan(profile: dict, agent_cfg: dict, seen_cache: dict,
     fresh    = filter_seen(all_items, seen_cache)
     filtered = top_k_items(fresh, profile["tracks"])
 
+    # Sanitize externally-sourced content before it enters the Qwen prompt
+    token_budget = 2000
+    sanitized = [sanitize_item(item, token_budget) for item in filtered]
+
     prompt = f"""You are the scan phase of a nightly research agent.
 Agent: {profile['name']}
 Context: {profile['context']}
 Tracks: {', '.join(profile['tracks'])}
 
-Tonight's items ({len(filtered)} pre-scored for relevance):
-{json.dumps(filtered, indent=2)[:8000]}
+Tonight's items ({len(sanitized)} pre-scored for relevance):
+{json.dumps(sanitized, indent=2)[:8000]}
 
 Tasks:
 1. Score each item 1-10 for relevance to this agent's tracks
@@ -1306,18 +1573,31 @@ Tasks:
 
 def phase_reflect(profile: dict, dirs: dict) -> dict:
     log("Phase 2: Reflecting on performance...")
-    perf = load_perf_log(dirs["perf_log"])
-    if not perf:
+    perf    = load_perf_log(dirs["perf_log"])
+    applied = load_applied_log(dirs)
+
+    if not perf and not applied:
         return {"observations": ["No performance data yet."], "improvement_areas": []}
+
+    applied_block = ""
+    if applied:
+        reverted = [e for e in applied if e.get("event") == "reverted"]
+        applied_ok = [e for e in applied if e.get("event") == "applied"]
+        applied_block = (
+            f"\nRecent build-job outcomes ({len(applied_ok)} applied, "
+            f"{len(reverted)} reverted):\n"
+            f"{json.dumps(applied[-10:], indent=2)[:1000]}\n"
+        )
 
     prompt = f"""You are the reflection phase of a {profile['name']} nightly review.
 Performance events:
-{json.dumps(perf, indent=2)[:3000]}
-
+{json.dumps(perf, indent=2)[:2500]}
+{applied_block}
 Analyze:
 1. What patterns appear in failures or escalations?
-2. What tasks could use a cheaper/faster model?
-3. One concrete process improvement for tomorrow?
+2. Which previously applied changes were reverted and why?
+3. What tasks could use a cheaper/faster model?
+4. One concrete process improvement for tomorrow?
 
 Return JSON only:
 {{
@@ -1343,6 +1623,8 @@ def phase_deep_research(profile: dict, scan_results: dict,
         return {"research": [], "synthesis": ""}
 
     enriched = ollama_enrich_findings(findings, profile)
+    # Qwen output is untrusted — sanitize before sending to Claude
+    enriched = [sanitize_item(item) for item in enriched]
     priority = scan_results.get("priority_track", "AI/ML")  # noqa: F841
 
     log("Phase 3b: Claude deep synthesis...")
@@ -1400,11 +1682,11 @@ def phase_judge_and_stage(profile: dict, scan: dict, reflect: dict, research: di
         experimentation_summary = f"""
 
 Experimentation Results ({validation_count}/{experiment_count} changes validated):
-{json.dumps([{{
+{json.dumps([{
     "title": vc["title"],
     "validation_score": vc["validation_score"],
     "experiment_type": vc["experiment_type"]
-}} for vc in validated_changes], indent=2)}
+} for vc in validated_changes], indent=2)}
 
 Validation notes: Only changes with validation score >= 0.7 are considered for staging."""
     else:
@@ -1470,7 +1752,7 @@ Judge summary:
 {summary}
 
 Staged actions (title + description):
-{json.dumps([{{"title": a.get("title", ""), "description": a.get("description", "")}}
+{json.dumps([{"title": a.get("title", ""), "description": a.get("description", "")}
              for a in staged], indent=2)}
 
 Extract 3-7 concise, generalizable lessons from this run. Each lesson should be an
@@ -1552,29 +1834,26 @@ def phase_experimentation(profile: dict, scan: dict, reflect: dict, research: di
         }
         experiments.append(experiment)
     
-    # In a full implementation, this would actually run the experiments
-    # For now, we simulate based on heuristics and return validation results
     validation_results = {}
     validated_changes = []
-    
+
     for experiment in experiments:
-        # Simple heuristic validation - in reality would run actual tests
         change_title = experiment["change_title"]
-        # Simulate validation based on change characteristics
-        validation_score = _simulate_experiment_result(experiment, profile)
+        log(f"  Running {experiment['experiment_type']} for: {change_title[:60]}")
+        validation_score, metrics = _run_experiment(experiment, profile)
         validation_results[change_title] = {
             "score": validation_score,
-            "passed": validation_score >= 0.7,  # 70% threshold for success
-            "metrics": _get_experiment_metrics(experiment),
-            "recommendation": "proceed" if validation_score >= 0.7 else "reject"
+            "passed": validation_score >= 0.7,
+            "metrics": metrics,
+            "recommendation": "proceed" if validation_score >= 0.7 else "reject",
         }
-        
+
         if validation_score >= 0.7:
             validated_changes.append({
                 "title": change_title,
                 "description": experiment["change_description"],
                 "validation_score": validation_score,
-                "experiment_type": experiment["experiment_type"]
+                "experiment_type": experiment["experiment_type"],
             })
     
     log(f"  Completed {len(experiments)} experiments, validated {len(validated_changes)} changes")
@@ -1621,57 +1900,170 @@ def _define_success_metrics(change: dict, profile: dict) -> list[str]:
     return base_metrics
 
 
-def _simulate_experiment_result(experiment: dict, profile: dict) -> float:
-    """Simulate experiment results based on change characteristics.
-    
-    Returns a score between 0.0 and 1.0 indicating validation success.
+def _run_ab_test_prompt(change: dict, profile: dict) -> tuple[float, dict]:
+    """Test a proposed prompt/model change by evaluating it from two angles with Ollama.
+
+    Returns (score 0-1, metrics dict).
     """
-    # Base score slightly above neutral to encourage experimentation
-    score = 0.55
-    
-    # Adjust based on change characteristics
-    desc = experiment.get("change_description", "").lower()
-    title = experiment.get("change_title", "").lower()
-    
-    # Positive indicators
-    if any(word in desc + title for word in ["documentation", "comment", "clarity"]):
-        score += 0.2
-    if any(word in desc + title for word in ["error handling", "validation", "check"]):
-        score += 0.15
-    if any(word in desc + title for word in ["simplify", "refactor", "clean"]):
-        score += 0.1
-    if any(word in desc + title for word in ["test", "validation"]):
-        score += 0.1
-    
-    # Negative indicators (risk factors)
-    if any(word in desc + title for word in ["delete", "remove", "destroy"]):
-        score -= 0.3
-    if any(word in desc + title for word in ["rewrite", "replace", "overhaul"]):
-        score -= 0.2
-    if any(word in desc + title for word in ["complex", "complicated", "intricate"]):
-        score -= 0.1
-    if "experimental" in desc + title or "beta" in desc + title:
-        score -= 0.15
-    
-    # Clamp to valid range
-    return max(0.0, min(1.0, score))
+    context = f"Agent: {profile['name']}\nTracks: {', '.join(profile['tracks'])}"
+
+    prompt_a = (
+        f"{context}\n\n"
+        f"Proposed change: {change.get('change_title', '')}\n"
+        f"Description: {change.get('change_description', '')}\n\n"
+        "Rate this change on three dimensions (1-10 each):\n"
+        "  clarity — how clear and specific is the proposed change?\n"
+        "  feasibility — how easily can it be implemented safely?\n"
+        "  impact — how much will it improve research quality?\n"
+        'Return JSON only: {"clarity": N, "feasibility": N, "impact": N, "reasoning": "..."}'
+    )
+    prompt_b = (
+        f"{context}\n\n"
+        f"Proposed change: {change.get('change_title', '')}\n"
+        f"Description: {change.get('change_description', '')}\n\n"
+        "Identify the top risks of this change and rate overall risk (1-10, higher = riskier).\n"
+        'Return JSON only: {"risks": ["..."], "risk_score": N, "mitigatable": true}'
+    )
+
+    result_a = ollama_chat(prompt_a)
+    result_b = ollama_chat(prompt_b)
+
+    score = 0.5
+    metrics: dict = {}
+    try:
+        a = extract_json(result_a)
+        avg_pos = (
+            float(a.get("clarity", 5)) +
+            float(a.get("feasibility", 5)) +
+            float(a.get("impact", 5))
+        ) / 30.0
+        score += avg_pos * 0.35
+        metrics.update({"clarity": a.get("clarity"), "feasibility": a.get("feasibility"),
+                        "impact": a.get("impact"), "reasoning_a": a.get("reasoning", "")})
+    except Exception:
+        pass
+    try:
+        b = extract_json(result_b)
+        risk_penalty = (float(b.get("risk_score", 5)) / 10.0) * 0.25
+        score -= risk_penalty
+        if b.get("mitigatable"):
+            score += 0.05
+        metrics.update({"risk_score": b.get("risk_score"), "mitigatable": b.get("mitigatable"),
+                        "risks": b.get("risks", [])})
+    except Exception:
+        pass
+
+    return max(0.0, min(1.0, score)), metrics
 
 
-def _get_experiment_metrics(experiment: dict) -> dict:
-    """Get simulated metrics for an experiment."""
-    return {
-        "implementation_feasibility": 0.8,
-        "risk_assessment": 0.9,
-        "performance_improvement": 0.6,
-        "quality_improvement": 0.7,
-        "cost_reduction": 0.5,
-        "user_satisfaction": 0.75
-    }
+def _run_config_validation(change: dict) -> tuple[float, dict]:
+    """Write proposed config content to a temp file and attempt to parse it.
+
+    Returns (score 0-1, metrics dict).
+    """
+    content = change.get("change_description", "")
+    metrics: dict = {"method": "config_parse"}
+
+    # Try JSON parse
+    try:
+        json.loads(content)
+        metrics["parse_result"] = "valid_json"
+        return 0.9, metrics
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Try YAML parse
+    if YAML_AVAILABLE:
+        try:
+            yaml.safe_load(content)
+            metrics["parse_result"] = "valid_yaml"
+            return 0.85, metrics
+        except Exception:
+            pass
+
+    # Try writing to temp file (checks for encoding/path issues at minimum)
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=True) as f:
+            f.write(content)
+        metrics["parse_result"] = "writable_text"
+        return 0.55, metrics
+    except Exception as e:
+        metrics["parse_result"] = f"write_failed: {e}"
+        return 0.2, metrics
+
+
+def _run_mock_integration(change: dict) -> tuple[float, dict]:
+    """Check reachability of any URLs referenced in the proposed change.
+
+    Returns (score 0-1, metrics dict).
+    """
+    text = change.get("change_description", "") + " " + change.get("change_title", "")
+    urls = re.findall(r"https?://[^\s<>\"{}|\\^`\[\]]+", text)
+    metrics: dict = {"urls_found": len(urls)}
+
+    if not urls:
+        return 0.6, metrics   # No URLs to test — neutral pass
+
+    reachable = 0
+    for url in urls[:3]:
+        try:
+            r = requests.head(url, timeout=5, allow_redirects=True)
+            if r.status_code < 500:
+                reachable += 1
+        except Exception:
+            pass
+
+    metrics["urls_reachable"] = reachable
+    score = 0.4 + (reachable / len(urls[:3])) * 0.5
+    return score, metrics
+
+
+def _run_logic_validation(change: dict, profile: dict) -> tuple[float, dict]:
+    """Ask Ollama to evaluate the feasibility and logical soundness of a change.
+
+    Returns (score 0-1, metrics dict).
+    """
+    prompt = (
+        f"You are evaluating a proposed change for a {profile['name']}.\n\n"
+        f"Change: {change.get('change_title', '')}\n"
+        f"Description: {change.get('change_description', '')}\n\n"
+        "Is this change logically sound, safe to implement, and likely to improve "
+        "the agent's research quality?\n"
+        "Rate 1-10 and give a brief explanation.\n"
+        'Return JSON only: {"score": N, "feasible": true, "reasoning": "..."}'
+    )
+    result = ollama_chat(prompt)
+    metrics: dict = {}
+    try:
+        obj = extract_json(result)
+        raw = float(obj.get("score", 5))
+        score = raw / 10.0
+        if not obj.get("feasible", True):
+            score *= 0.6
+        metrics = {"ollama_score": raw, "feasible": obj.get("feasible"),
+                   "reasoning": obj.get("reasoning", "")}
+        return max(0.0, min(1.0, score)), metrics
+    except Exception:
+        return 0.5, {"error": "parse_failed"}
+
+
+def _run_experiment(experiment: dict, profile: dict) -> tuple[float, dict]:
+    """Dispatch to the appropriate real experiment runner based on experiment_type."""
+    etype = experiment.get("experiment_type", "logic_validation")
+    if etype == "ab_test_prompt":
+        return _run_ab_test_prompt(experiment, profile)
+    elif etype == "config_validation":
+        return _run_config_validation(experiment)
+    elif etype == "mock_integration":
+        return _run_mock_integration(experiment)
+    else:
+        return _run_logic_validation(experiment, profile)
 
 
 # ── Write Staged Files ────────────────────────────────────────────────────────
 
-def write_staging(judge: dict, date_str: str, dirs: dict) -> list:
+def write_staging(judge: dict, date_str: str, dirs: dict,
+                  dry_run: bool = False) -> list:
     staging_dir = dirs["staging_dir"]
     actions     = judge.get("staged_actions", [])
     manifest    = []
@@ -1679,19 +2071,25 @@ def write_staging(judge: dict, date_str: str, dirs: dict) -> list:
         risk  = action.get("risk", "high")
         fname = f"{date_str}_{i:02d}_{action.get('action_type', 'change')}_{risk}.staged"
         fpath = staging_dir / fname
-        with open(fpath, "w") as f:
-            json.dump(action, f, indent=2)
+        if dry_run:
+            log(f"  [DRY RUN] Would stage [{risk}]: {action.get('title', '')}")
+        else:
+            with open(fpath, "w") as f:
+                json.dump(action, f, indent=2)
+            log(f"  Staged [{risk}]: {action.get('title', '')}")
         manifest.append({"file": str(fpath), "risk": risk, "title": action.get("title", "")})
-        log(f"  Staged [{risk}]: {action.get('title', '')}")
-    with open(staging_dir / f"{date_str}_manifest.json", "w") as f:
-        json.dump(manifest, f, indent=2)
+    if not dry_run:
+        with open(staging_dir / f"{date_str}_manifest.json", "w") as f:
+            json.dump(manifest, f, indent=2)
     return manifest
 
 # ── Write Changelog ───────────────────────────────────────────────────────────
 
 def write_changelog(date_str: str, agent_name: str, profile: dict,
                     scan: dict, reflect: dict, research: dict,
-                    judge: dict, manifest: list, dirs: dict) -> str:
+                    judge: dict, manifest: list, dirs: dict,
+                    experimentation: dict = None,
+                    dry_run: bool = False) -> str:
     changelog = dirs["logs_dir"] / f"{date_str}-changelog.md"
     lines = [
         f"# Dream Cycle — {profile['name']} — {date_str}",
@@ -1751,14 +2149,21 @@ def write_changelog(date_str: str, agent_name: str, profile: dict,
         lines.append(f"[{m['risk'].upper()}] {m['title']}")
 
     lines += [f"\n---\n*Generated by dream_cycle.py ({agent_name}) at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*"]
-    with open(changelog, "w") as f:
-        f.write("\n".join(lines))
-    log(f"Changelog: {changelog}")
+    if dry_run:
+        log(f"[DRY RUN] Would write changelog: {changelog}")
+    else:
+        with open(changelog, "w") as f:
+            f.write("\n".join(lines))
+        log(f"Changelog: {changelog}")
     return str(changelog)
 
 # ── Send Summary ──────────────────────────────────────────────────────────────
 
-def send_gmail_summary(changelog_path: str, judge: dict, scan: dict, agent_name: str):
+def send_gmail_summary(changelog_path: str, judge: dict, scan: dict, agent_name: str,
+                       dry_run: bool = False):
+    if dry_run:
+        log("[DRY RUN] Would send summary email")
+        return
     subject = (
         f"Dream Cycle [{agent_name}] {datetime.now().strftime('%Y-%m-%d')} "
         f"— {scan.get('priority_track', '?')} | Score {judge.get('tonight_score', '?')}/10"
@@ -1788,14 +2193,80 @@ def send_gmail_summary(changelog_path: str, judge: dict, scan: dict, agent_name:
         f.write(f"Subject: {subject}\n\n{body}")
     log(f"msmtp not configured — saved to {mail_path}")
 
+# ── Status display ────────────────────────────────────────────────────────────
+
+def show_status(agent_name: str | None = None, n: int = 10):
+    """Print a compact table of the last N runs from ChromaDB (or changelog files)."""
+    chroma = get_chroma_client()
+    rows: list[dict] = []
+
+    if chroma:
+        coll = _run_nodes(chroma)
+        try:
+            if agent_name:
+                results = coll.get(
+                    where={"agent_name": agent_name},
+                    include=["documents", "metadatas"],
+                )
+            else:
+                results = coll.get(include=["documents", "metadatas"])
+            ids   = results.get("ids", [])
+            metas = results.get("metadatas", [])
+            for rid, meta in zip(ids, metas):
+                rows.append({
+                    "run_id":    rid,
+                    "agent":     meta.get("agent_name", "?"),
+                    "date":      meta.get("date_str", "?"),
+                    "track":     meta.get("priority_track", "?")[:30],
+                    "score":     meta.get("tonight_score", "?"),
+                    "selected":  meta.get("times_selected", 0),
+                })
+        except Exception as exc:
+            log(f"ChromaDB status query failed: {exc}")
+
+    if not rows:
+        # Fallback: scan changelog files
+        for agent_dir in sorted(BASE_DIR.iterdir()):
+            if not agent_dir.is_dir():
+                continue
+            if agent_name and agent_dir.name != agent_name:
+                continue
+            logs_dir = agent_dir / "logs"
+            if not logs_dir.exists():
+                continue
+            for cl in sorted(logs_dir.glob("*-changelog.md"), reverse=True)[:n]:
+                rows.append({
+                    "run_id":   cl.stem,
+                    "agent":    agent_dir.name,
+                    "date":     cl.stem[:10],
+                    "track":    "—",
+                    "score":    "—",
+                    "selected": "—",
+                })
+
+    if not rows:
+        print("No run history found.")
+        return
+
+    rows.sort(key=lambda r: (r["date"], r["run_id"]), reverse=True)
+    rows = rows[:n]
+
+    print(f"\n{'Date':<12} {'Agent':<15} {'Score':>5}  {'Sel':>4}  {'Track'}")
+    print("─" * 70)
+    for r in rows:
+        print(f"{r['date']:<12} {r['agent']:<15} {str(r['score']):>5}  "
+              f"{str(r['selected']):>4}  {r['track']}")
+    print()
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     global LOCAL_MODEL
 
     parser = argparse.ArgumentParser(description="Dream Cycle — nightly research agent")
-    parser.add_argument("--agent",       choices=list(AGENT_PROFILES.keys()),
-                        help="Agent profile to run")
+    parser.add_argument("--agent",
+                        help="Agent profile to run (built-in or manifest agent id)")
     parser.add_argument("--reconfigure", action="store_true",
                         help="Re-run setup for the selected agent")
     parser.add_argument("--list-agents", action="store_true",
@@ -1806,62 +2277,112 @@ def main():
                         help="Skip the experimentation phase and go directly from research to judge")
     parser.add_argument("--audit-dormant", action="store_true",
                         help="Review dormant lessons for the selected agent and exit")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Run all phases but write no files and send no email")
+    parser.add_argument("--status", action="store_true",
+                        help="Print a summary table of recent runs and exit")
+    parser.add_argument("--status-n", type=int, default=10, metavar="N",
+                        help="Number of runs to show with --status (default: 10)")
     args = parser.parse_args()
 
+    if args.status:
+        show_status(agent_name=args.agent, n=args.status_n)
+        return
+
     if args.list_agents:
-        # Show both built-in profiles and discovered agents
         print("\nAvailable agents:")
         print("  Built-in profiles:")
         for name, p in AGENT_PROFILES.items():
             print(f"    {name:15} — {p['name']}")
-        print("  Discovered agents:")
+        print("  Manifest agents:")
         discovered_agents = load_agent_manifests()
         if discovered_agents:
             for agent_id, manifest in discovered_agents.items():
                 print(f"    {agent_id:15} — {manifest['name']} (v{manifest['version']})")
         else:
-            print("    (none discovered)")
+            print("    (none)")
+        if PLUGINS_AVAILABLE:
+            pm = PluginManager()
+            pm.load_plugins()
+            plugin_names = pm.list_agent_plugins()
+            print("  Plugin agents:")
+            if plugin_names:
+                for pname in plugin_names:
+                    p = pm.get_agent_plugin(pname)
+                    print(f"    {pname:15} — {p.get_description() if p else ''}")
+            else:
+                print("    (none)")
         return
 
-    # Determine which agent to run: CLI argument takes precedence, then discovered agents, then default
+    def _manifest_to_profile(manifest: dict) -> dict:
+        return {
+            "name":                   manifest["name"],
+            "tracks":                 [f"Custom: {manifest['type']}"],
+            "arxiv_queries":          [],
+            "default_github_repos":   [],
+            "fetch_cves":             False,
+            "fetch_github_trending":  False,
+            "github_trending_query":  manifest.get("type", "ai agent machine-learning"),
+            "context": f"Custom agent targeting: {', '.join(manifest['scan_targets'][:3])}...",
+        }
+
+    def _plugin_to_profile(plugin) -> dict:
+        tracks = [t.get_name() for t in plugin.get_research_tracks()]
+        arxiv_queries = []
+        repos = []
+        for track in plugin.get_research_tracks():
+            for q in track.get_arxiv_queries():
+                arxiv_queries.append((q.get("query", ""), q.get("max_results", 5)))
+            repos.extend(track.get_github_repos())
+        return {
+            "name":                  plugin.get_agent_name(),
+            "tracks":                tracks or ["General Research"],
+            "arxiv_queries":         arxiv_queries,
+            "default_github_repos":  repos,
+            "fetch_cves":            any(t.get_cves_enabled() for t in plugin.get_research_tracks()),
+            "fetch_github_trending": any(t.get_github_trending_enabled() for t in plugin.get_research_tracks()),
+            "github_trending_query": plugin.get_agent_name(),
+            "context":               plugin.get_description(),
+        }
+
+    # Determine which agent to run: CLI argument takes precedence, then default
     if args.agent:
         agent_name = args.agent
-        if agent_name not in AGENT_PROFILES:
-            # Check if it's a discovered agent
+        if agent_name in AGENT_PROFILES:
+            profile = AGENT_PROFILES[agent_name]
+        else:
             discovered_agents = load_agent_manifests()
             if agent_name in discovered_agents:
-                manifest = discovered_agents[agent_name]
-                # Convert manifest to profile-like structure
-                profile = {
-                    "name": manifest["name"],
-                    "tracks": [f"Custom: {manifest['type']}"],
-                    "arxiv_queries": [],  # Would be populated from scan_targets in a full implementation
-                    "default_github_repos": [],
-                    "fetch_cves": False,
-                    "fetch_github_trending": False,
-                    "context": f"Custom agent targeting: {', '.join(manifest['scan_targets'][:3])}..."
-                }
+                profile = _manifest_to_profile(discovered_agents[agent_name])
+            elif PLUGINS_AVAILABLE:
+                pm = PluginManager()
+                pm.load_plugins()
+                plugin = pm.get_agent_plugin(agent_name)
+                if plugin:
+                    profile = _plugin_to_profile(plugin)
+                else:
+                    print(f"Error: Unknown agent '{agent_name}'. Use --list-agents to see available agents.")
+                    return
             else:
                 print(f"Error: Unknown agent '{agent_name}'. Use --list-agents to see available agents.")
                 return
-        else:
-            profile = AGENT_PROFILES[agent_name]
     else:
-        # No agent specified, check for discovered agents first, then fall back to default
+        # No agent specified — check manifest agents, then plugins, then fall back to default
         discovered_agents = load_agent_manifests()
         if discovered_agents:
-            # Use the first discovered agent
             agent_id, manifest = next(iter(discovered_agents.items()))
             agent_name = agent_id
-            profile = {
-                "name": manifest["name"],
-                "tracks": [f"Custom: {manifest['type']}"],
-                "arxiv_queries": [],  # Would be populated from scan_targets in a full implementation
-                "default_github_repos": [],
-                "fetch_cves": False,
-                "fetch_github_trending": False,
-                "context": f"Custom agent targeting: {', '.join(manifest['scan_targets'][:3])}..."
-            }
+            profile = _manifest_to_profile(manifest)
+        elif PLUGINS_AVAILABLE:
+            pm = PluginManager()
+            pm.load_plugins()
+            plugin_names = pm.list_agent_plugins()
+            if plugin_names:
+                agent_name = plugin_names[0]
+                profile = _plugin_to_profile(pm.get_agent_plugin(agent_name))
+            else:
+                agent_name = "ai_research"
+                profile = AGENT_PROFILES[agent_name]
         else:
             agent_name = "ai_research"
             profile = AGENT_PROFILES[agent_name]
@@ -1874,7 +2395,9 @@ def main():
         audit_dormant_lessons(agent_name)
         return
 
-    log(f"=== Dream Cycle [{profile['name']}] — {date_str} (run={run_id}) ===")
+    dry_run = args.dry_run
+    log(f"=== Dream Cycle [{profile['name']}] — {date_str} (run={run_id})"
+        f"{' [DRY RUN]' if dry_run else ''} ===")
 
     config   = load_config()
     yaml_cfg = load_yaml_config()
@@ -1940,24 +2463,28 @@ def main():
                 if cid:
                     mark_lesson_superseded(cid)
 
-    store_lessons(lessons, agent_name, run_id)
+    if not dry_run:
+        store_lessons(lessons, agent_name, run_id)
 
     # Persist final score and summary; cumulative_value accumulates for UCB1
-    update_run_node(run_id, judge.get("tonight_score", 0), judge.get("summary", ""))
+    if not dry_run:
+        update_run_node(run_id, judge.get("tonight_score", 0), judge.get("summary", ""))
 
     # Post-run lesson decay cleanup — not inline with phases (Feature 3)
-    selected_run_ids = [p["run_id"] for p in parents]
-    decay_cfg        = yaml_cfg.get("lesson_decay", {})
-    apply_lesson_decay(
-        agent_name, selected_run_ids, run_id,
-        decay_factor      = float(decay_cfg.get("decay_factor",       0.98)),
-        dormant_threshold = float(decay_cfg.get("dormant_threshold",  0.15)),
-    )
+    if not dry_run:
+        selected_run_ids = [p["run_id"] for p in parents]
+        decay_cfg        = yaml_cfg.get("lesson_decay", {})
+        apply_lesson_decay(
+            agent_name, selected_run_ids, run_id,
+            decay_factor      = float(decay_cfg.get("decay_factor",       0.98)),
+            dormant_threshold = float(decay_cfg.get("dormant_threshold",  0.15)),
+        )
 
-    manifest = write_staging(judge, date_str, dirs)
+    manifest = write_staging(judge, date_str, dirs, dry_run=dry_run)
     changelog_path = write_changelog(date_str, agent_name, profile,
-                                     scan, reflect, research, judge, manifest, dirs)
-    send_gmail_summary(changelog_path, judge, scan, agent_name)
+                                     scan, reflect, research, judge, manifest, dirs,
+                                     experimentation, dry_run=dry_run)
+    send_gmail_summary(changelog_path, judge, scan, agent_name, dry_run=dry_run)
 
     log(f"=== Complete. {len(manifest)} actions staged. ===")
 if __name__ == "__main__":

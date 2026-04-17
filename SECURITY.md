@@ -10,7 +10,7 @@ Security fixes are applied to the `main` branch only. There are no versioned rel
 
 Please **do not open a public GitHub issue** for security reports.
 
-Email: [Mike Simonson](https://linkedin.com/in/simonsonmba) — use the contact link on LinkedIn to request a private email address.
+To report a vulnerability, open a [GitHub Security Advisory](https://github.com/SimonsonM/dream-cycle/security/advisories/new) — this keeps the report private until a fix is released.
 
 Include:
 - A clear description of the vulnerability and its impact

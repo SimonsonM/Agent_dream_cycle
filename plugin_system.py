@@ -157,28 +157,31 @@ class PluginManager:
     
     def _create_agent_from_config(self, config: Dict[str, Any], name: str) -> Optional[AgentPlugin]:
         """Create an agent plugin from configuration dictionary"""
+        outer_self = self
         try:
             class ConfigAgentPlugin(AgentPlugin):
                 def __init__(self, config_dict: Dict[str, Any]):
                     self._config = config_dict
-                
+
                 def get_agent_name(self) -> str:
                     return self._config.get("name", name)
-                
+
                 def get_description(self) -> str:
                     return self._config.get("description", f"A Dream Cycle agent: {name}")
-                
+
                 def get_version(self) -> str:
                     return self._config.get("version", "1.0.0")
-                
+
                 def get_research_tracks(self) -> List[ResearchTrackPlugin]:
                     tracks = []
                     for track_config in self._config.get("research_tracks", []):
-                        track = self._create_research_track_from_config(track_config, f"{name}_track_{len(tracks)}")
+                        track = outer_self._create_research_track_from_config(
+                            track_config, f"{name}_track_{len(tracks)}"
+                        )
                         if track:
                             tracks.append(track)
                     return tracks
-            
+
             return ConfigAgentPlugin(config)
         except Exception:
             return None

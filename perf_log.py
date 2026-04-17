@@ -14,7 +14,7 @@ from datetime import datetime
 from pathlib import Path
 
 BASE_DIR    = Path.home() / "dream-cycle"
-AGENT_NAMES = ["security", "marketing", "programming", "ai_research"]
+AGENT_NAMES = ["security", "marketing", "programming", "ai_research", "mcp"]
 
 
 def get_log_file(agent: str | None) -> Path:
