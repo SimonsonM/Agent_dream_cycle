@@ -2155,7 +2155,175 @@ def write_changelog(date_str: str, agent_name: str, profile: dict,
         with open(changelog, "w") as f:
             f.write("\n".join(lines))
         log(f"Changelog: {changelog}")
+        # Obsidian vault mirror (config-gated)
+        try:
+            mirror_to_vault(changelog, date_str, agent_name, profile, scan, judge, research)
+        except Exception as e:
+            log(f"[warn] vault mirror failed: {e}")
     return str(changelog)
+
+
+def _paper_slug(finding: dict) -> str:
+    """Stable slug for a paper: arxiv id if detectable, else title hash."""
+    import re as _re, hashlib as _hl
+    link = finding.get("link", "") or ""
+    m = _re.search(r"(\d{4}\.\d{4,5})", link)
+    if m:
+        return f"arxiv-{m.group(1)}"
+    title = (finding.get("title") or "untitled").strip()
+    slug = _re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:60]
+    h = _hl.md5(title.encode()).hexdigest()[:6]
+    return f"{slug}-{h}" if slug else f"paper-{h}"
+
+
+def _yaml_str(s: str) -> str:
+    """Escape a string for safe inclusion as a YAML scalar."""
+    if s is None:
+        return '""'
+    s = str(s).replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ").strip()
+    return f'"{s}"'
+
+
+def _write_paper_note(papers_dir: Path, finding: dict, date_str: str,
+                      agent_name: str, research_detail: dict = None) -> str:
+    """Create or update an atomic paper note. Returns the note's wikilink target."""
+    slug = _paper_slug(finding)
+    note_path = papers_dir / f"{slug}.md"
+    title = finding.get("title", "Untitled")
+    track = finding.get("track", "unknown")
+    source = finding.get("source", "")
+    link = finding.get("link", "")
+    score = finding.get("score", "?")
+    summary = finding.get("summary", "") or ""
+    deep = (research_detail or {}).get("deep_summary", "") or ""
+    applicability = (research_detail or {}).get("applicability", "") or ""
+
+    if note_path.exists():
+        # Update: append this date to seen_dates, refresh score/track if newer.
+        existing = note_path.read_text()
+        # Crude but safe: add a "Seen again" entry at the end.
+        appendum = f"\n\n## Seen again on {date_str} (agent: {agent_name})\n"
+        if score != "?":
+            appendum += f"- Score: {score}\n"
+        if deep and deep not in existing:
+            appendum += f"\n### Deep research notes\n\n{deep}\n"
+        note_path.write_text(existing + appendum)
+    else:
+        frontmatter = (
+            f"---\n"
+            f"type: paper\n"
+            f"title: {_yaml_str(title)}\n"
+            f"track: {_yaml_str(track)}\n"
+            f"source: {_yaml_str(source)}\n"
+            f"link: {_yaml_str(link)}\n"
+            f"first_seen: {date_str}\n"
+            f"first_agent: {agent_name}\n"
+            f"initial_score: {score}\n"
+            f"tags: [paper, {_re_slug_tag(track)}]\n"
+            f"---\n\n"
+        )
+        body = [f"# {title}", ""]
+        if link:
+            body += [f"**Source:** {link}", ""]
+        if summary:
+            body += ["## Summary", "", summary, ""]
+        if deep:
+            body += ["## Deep research notes", "", deep, ""]
+        if applicability:
+            body += [f"**Applicability:** {applicability}", ""]
+        body += [f"---", f"*First surfaced {date_str} by agent `{agent_name}`.*"]
+        note_path.write_text(frontmatter + "\n".join(body))
+    return slug
+
+
+def _re_slug_tag(s: str) -> str:
+    import re as _re
+    return _re.sub(r"[^a-z0-9]+", "-", (s or "unknown").lower()).strip("-") or "unknown"
+
+
+def _rewrite_changelog_with_wikilinks(body: str, findings: list,
+                                      research: list, slug_map: dict) -> str:
+    """Replace finding/research titles in the body with [[slug|Title]] wikilinks."""
+    out = body
+    for f in findings:
+        title = f.get("title")
+        slug = slug_map.get(id(f))
+        if title and slug and title in out:
+            # Swap the first occurrence of the bolded title with a wikilink.
+            out = out.replace(f"**{title}**", f"**[[{slug}|{title}]]**", 1)
+    for r in research:
+        title = r.get("title")
+        slug = slug_map.get(id(r))
+        if title and slug and title in out:
+            out = out.replace(f"### {title}", f"### [[{slug}|{title}]]", 1)
+    return out
+
+
+def mirror_to_vault(changelog: Path, date_str: str, agent_name: str,
+                    profile: dict, scan: dict, judge: dict,
+                    research: dict = None) -> None:
+    """Mirror changelog into Obsidian vault and emit atomic paper notes.
+
+    Config shape (top-level of config.yaml):
+        obsidian_vault:
+          enabled: true
+          path: ~/vault/40-Dream-Cycle
+          per_agent_subfolder: true
+          papers_path: ~/vault/30-Reference/papers
+          emit_paper_notes: true
+    """
+    cfg = load_yaml_config().get("obsidian_vault", {}) or {}
+    if not cfg.get("enabled"):
+        return
+    vault_path = Path(cfg.get("path", "~/vault/40-Dream-Cycle")).expanduser()
+    if cfg.get("per_agent_subfolder", True):
+        vault_path = vault_path / agent_name
+    vault_path.mkdir(parents=True, exist_ok=True)
+
+    body = Path(changelog).read_text()
+
+    # Build paper notes for top_findings and deep research entries.
+    slug_map = {}
+    if cfg.get("emit_paper_notes", True):
+        papers_dir = Path(cfg.get("papers_path", "~/vault/30-Reference/papers")).expanduser()
+        papers_dir.mkdir(parents=True, exist_ok=True)
+
+        findings = scan.get("top_findings", []) or []
+        research_items = (research or {}).get("research", []) or []
+
+        # Index research by title for merging into matching findings.
+        research_by_title = {r.get("title"): r for r in research_items if r.get("title")}
+
+        for f in findings:
+            detail = research_by_title.get(f.get("title"))
+            slug = _write_paper_note(papers_dir, f, date_str, agent_name, detail)
+            slug_map[id(f)] = slug
+
+        # Research-only items that didn't have a matching finding.
+        finding_titles = {f.get("title") for f in findings}
+        for r in research_items:
+            if r.get("title") in finding_titles:
+                continue
+            slug = _write_paper_note(papers_dir, r, date_str, agent_name, r)
+            slug_map[id(r)] = slug
+
+        body = _rewrite_changelog_with_wikilinks(body, findings, research_items, slug_map)
+
+    dest = vault_path / f"{date_str}-changelog.md"
+    priority = scan.get("priority_track", "unknown")
+    score = judge.get("tonight_score", "?")
+    frontmatter = (
+        f"---\n"
+        f"date: {date_str}\n"
+        f"type: dream-cycle\n"
+        f"agent: {agent_name}\n"
+        f"priority_track: {priority}\n"
+        f"score: {score}\n"
+        f"tags: [dream-cycle, {agent_name}]\n"
+        f"---\n\n"
+    )
+    dest.write_text(frontmatter + body)
+    log(f"Vault mirror: {dest} ({len(slug_map)} paper notes)")
 
 # ── Send Summary ──────────────────────────────────────────────────────────────
 
