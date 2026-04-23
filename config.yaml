@@ -50,3 +50,16 @@ lesson_decay:
 # Set bridge_probability: 0.0 to disable.
 cross_domain_bridge:
   bridge_probability: 0.20
+
+# ── Feature 5: Obsidian Vault Mirror ────────────────────────────────────────
+# After writing a changelog to ~/dream-cycle/<agent>/logs/, also copy it
+# to the Obsidian vault with frontmatter for Dataview queries.
+# The original logs location is untouched — this is a read-only mirror
+# intended to make Dream Cycle output visible in the knowledge base.
+#
+# per_agent_subfolder: true  → writes to <path>/<agent>/<date>-changelog.md
+# per_agent_subfolder: false → writes to <path>/<agent>-<date>-changelog.md
+obsidian_vault:
+  enabled: true
+  path: ~/vault/40-Dream-Cycle
+  per_agent_subfolder: true

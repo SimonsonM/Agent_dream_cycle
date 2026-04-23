@@ -2155,7 +2155,48 @@ def write_changelog(date_str: str, agent_name: str, profile: dict,
         with open(changelog, "w") as f:
             f.write("\n".join(lines))
         log(f"Changelog: {changelog}")
+        # Obsidian vault mirror (config-gated)
+        try:
+            mirror_to_vault(changelog, date_str, agent_name, profile, scan, judge)
+        except Exception as e:
+            log(f"[warn] vault mirror failed: {e}")
     return str(changelog)
+
+
+def mirror_to_vault(changelog: Path, date_str: str, agent_name: str,
+                    profile: dict, scan: dict, judge: dict) -> None:
+    """Mirror changelog into Obsidian vault if enabled in config.yaml.
+
+    Config shape (top-level of config.yaml):
+        obsidian_vault:
+          enabled: true
+          path: ~/vault/40-Dream-Cycle
+          per_agent_subfolder: true
+    """
+    cfg = load_yaml_config().get("obsidian_vault", {}) or {}
+    if not cfg.get("enabled"):
+        return
+    vault_path = Path(cfg.get("path", "~/vault/40-Dream-Cycle")).expanduser()
+    if cfg.get("per_agent_subfolder", True):
+        vault_path = vault_path / agent_name
+    vault_path.mkdir(parents=True, exist_ok=True)
+
+    dest = vault_path / f"{date_str}-changelog.md"
+    body = Path(changelog).read_text()
+    priority = scan.get("priority_track", "unknown")
+    score = judge.get("tonight_score", "?")
+    frontmatter = (
+        f"---\n"
+        f"date: {date_str}\n"
+        f"type: dream-cycle\n"
+        f"agent: {agent_name}\n"
+        f"priority_track: {priority}\n"
+        f"score: {score}\n"
+        f"tags: [dream-cycle, {agent_name}]\n"
+        f"---\n\n"
+    )
+    dest.write_text(frontmatter + body)
+    log(f"Vault mirror: {dest}")
 
 # ── Send Summary ──────────────────────────────────────────────────────────────
 
