@@ -63,3 +63,7 @@ obsidian_vault:
   enabled: true
   path: ~/vault/40-Dream-Cycle
   per_agent_subfolder: true
+  # Paper notes: each top_finding / research entry gets its own atomic note.
+  # Recurring papers update in place with a "Seen again" section.
+  emit_paper_notes: true
+  papers_path: ~/vault/30-Reference/papers
