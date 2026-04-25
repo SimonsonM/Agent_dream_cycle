@@ -1,0 +1,52 @@
+{
+  "global": {
+    "local_model": "qwen2.5:7b"
+  },
+  "agents": {
+    "ai_research": {
+      "github_repos": [
+        "huggingface/transformers",
+        "ollama/ollama",
+        "anthropics/anthropic-sdk-python",
+        "facebookresearch/segment-anything",
+        "ggerganov/llama.cpp"
+      ]
+    },
+    "programming": {
+      "github_repos": [
+        "astral-sh/uv",
+        "astral-sh/ruff",
+        "microsoft/TypeScript",
+        "vercel/next.js",
+        "docker/compose"
+      ]
+    },
+    "marketing": {
+      "github_repos": [
+        "apache/superset",
+        "metabase/metabase",
+        "PostHog/posthog",
+        "plausible/analytics",
+        "matomo-org/matomo"
+      ]
+    },
+    "mcp": {
+      "github_repos": [
+        "modelcontextprotocol/servers",
+        "modelcontextprotocol/python-sdk",
+        "modelcontextprotocol/typescript-sdk",
+        "modelcontextprotocol/specification",
+        "punkpeye/awesome-mcp-servers"
+      ]
+    },
+    "security": {
+      "github_repos": [
+        "projectdiscovery/nuclei",
+        "OWASP/CheatSheetSeries",
+        "trufflesecurity/trufflehog",
+        "aquasecurity/trivy",
+        "RhinoSecurityLabs/pacu"
+      ]
+    }
+  }
+}

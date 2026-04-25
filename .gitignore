@@ -8,3 +8,10 @@ dist/
 build/
 .env
 *.log
+.venv/
+*.backup
+*.backup2
+*.bak
+*.tmp
+.pytest_cache/
+config.json

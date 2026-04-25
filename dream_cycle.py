@@ -9,6 +9,9 @@ Usage:
   dream_cycle.py --agent security --reconfigure
   dream_cycle.py --list-agents
 """
+from pathlib import Path as _P
+from dotenv import load_dotenv as _ld
+_ld(_P(__file__).parent / '.env')
 
 import argparse
 import hashlib
@@ -371,9 +374,16 @@ CHROMA_DIR = BASE_DIR / "chroma_db"
 
 # ── Models ────────────────────────────────────────────────────────────────────
 LOCAL_MODEL    = ""
-CLAUDE_MODEL   = "claude-sonnet-4-6"
+CLAUDE_MODEL   = os.getenv("DREAM_CYCLE_FRONTIER_MODEL", "claude-opus-4-7")
 client         = anthropic.Anthropic()
 UCB1_C_DEFAULT = 1.4
+
+# ── Routing config ────────────────────────────────────────────────────────────
+# Escalate to frontier (Opus) only when local confidence is below this threshold
+# OR an explicit force_frontier flag is set. Drives PULSE-style cost discipline.
+LOCAL_CONFIDENCE_THRESHOLD = float(os.getenv("DREAM_CYCLE_LOCAL_CONF_THRESHOLD", "0.55"))
+# When DREAM_CYCLE_LOCAL_ONLY=1, NO frontier calls are made even on escalation.
+LOCAL_ONLY = os.getenv("DREAM_CYCLE_LOCAL_ONLY", "0") == "1"
 
 # ── Agent Profiles ────────────────────────────────────────────────────────────
 AGENT_PROFILES = {
@@ -918,6 +928,92 @@ def claude_chat(prompt: str, system: str = "") -> str:
         log(f"Claude error: {e}")
         return ""
 
+# ── Reasoning router ──────────────────────────────────────────────────────────
+# PULSE-style routing: local-first, frontier on escalation only.
+# Every non-trivial reasoning call should go through reason() rather than
+# claude_chat() directly. claude_chat() remains as the raw frontier client.
+
+def _local_self_score(prompt: str, system: str = "") -> tuple[str, float]:
+    """
+    Run the prompt against Qwen and ask it to self-rate confidence.
+    Returns (response_text, confidence in [0,1]).
+    The confidence is parsed from a trailing '<<CONFIDENCE: 0.NN>>' marker
+    that we ask the model to emit; if missing, default to 0.5 (neutral).
+    """
+    instrumented_system = (system + "\n\n" if system else "") + (
+        "After your full response, on a NEW LINE, emit exactly:\n"
+        "<<CONFIDENCE: X.YY>>\n"
+        "where X.YY is your self-assessed confidence (0.00 = guessing, "
+        "1.00 = certain) that your response is correct, complete, and "
+        "well-formed for the task. Be honest; lower scores trigger expert review."
+    )
+    raw = ollama_chat(prompt, system=instrumented_system)
+    if not raw:
+        return "", 0.0
+    m = re.search(r"<<\s*CONFIDENCE\s*:\s*([0-9]*\.?[0-9]+)\s*>>", raw)
+    conf = 0.5
+    if m:
+        try:
+            conf = max(0.0, min(1.0, float(m.group(1))))
+        except ValueError:
+            pass
+    cleaned = re.sub(r"<<\s*CONFIDENCE\s*:.*?>>", "", raw).strip()
+    return cleaned, conf
+
+def reason(prompt: str, system: str = "", *,
+           force_frontier: bool = False,
+           force_local: bool = False,
+           threshold: float | None = None) -> tuple[str, str]:
+    """
+    Route a reasoning task to local-first, frontier on escalation.
+
+    Returns (response_text, tier_used) where tier_used is one of:
+      "local" | "frontier" | "local_fallback"
+
+    - force_frontier=True: skip local entirely (use for genuinely hard reasoning
+      where you've already decided local can't do it)
+    - force_local=True: never escalate (use for cheap summarization, lesson
+      extraction, etc.)
+    - threshold: override LOCAL_CONFIDENCE_THRESHOLD per-call
+    """
+    thr = threshold if threshold is not None else LOCAL_CONFIDENCE_THRESHOLD
+
+    # Hard local-only mode (for offline / no-credit operation)
+    if LOCAL_ONLY and not force_frontier:
+        text, _ = _local_self_score(prompt, system)
+        return text, "local"
+
+    if force_frontier:
+        result = claude_chat(prompt, system=system)
+        if not result and not LOCAL_ONLY:
+            log("Frontier failed; falling back to local")
+            text, _ = _local_self_score(prompt, system)
+            return text, "local_fallback"
+        return result, "frontier"
+
+    if force_local:
+        text, _ = _local_self_score(prompt, system)
+        return text, "local"
+
+    # Standard path: local first, escalate on low confidence
+    text, conf = _local_self_score(prompt, system)
+    if conf >= thr and text:
+        log(f"  reason: local (confidence={conf:.2f}, threshold={thr:.2f})")
+        return text, "local"
+
+    if LOCAL_ONLY:
+        log(f"  reason: local-only mode, accepting low-confidence local "
+            f"output (confidence={conf:.2f})")
+        return text, "local"
+
+    log(f"  reason: escalating to frontier (local confidence={conf:.2f} "
+        f"< threshold={thr:.2f})")
+    frontier_result = claude_chat(prompt, system=system)
+    if frontier_result:
+        return frontier_result, "frontier"
+    log("  reason: frontier failed, returning low-confidence local output")
+    return text, "local_fallback"
+
 # ── Ollama helpers (token savers) ─────────────────────────────────────────────
 
 def ollama_enrich_findings(findings: list[dict], profile: dict) -> list[dict]:
@@ -1328,7 +1424,7 @@ recommendation must be exactly one of:
   "discard"   — existing lesson is stronger; lower confidence on the new one
 """
 
-    raw = claude_chat(prompt)
+    raw, _tier = reason(prompt, force_frontier=True)  # contradictions = genuine reasoning
     try:
         start = raw.find("[")
         end   = raw.rfind("]")
@@ -1660,7 +1756,7 @@ Return JSON:
   "synthesis": "..."
 }}"""
 
-    result = claude_chat(prompt)
+    result, _tier = reason(prompt)  # synthesis: local-first, escalate on low confidence
     try:
         return extract_json(result)
     except Exception:
@@ -1721,7 +1817,7 @@ Return JSON:
   ]
 }}"""
 
-    result = claude_chat(prompt)
+    result, _tier = reason(prompt)  # judge: local-first, escalate on low confidence
     try:
         return extract_json(result)
     except Exception:
@@ -1769,7 +1865,7 @@ Return a JSON array only — no prose before or after:
   }}
 ]"""
 
-    result = claude_chat(prompt)
+    result, _tier = reason(prompt, force_local=True)  # lesson extraction: summarization, never escalate
 
     # Prefer a bare JSON array; fall back to object wrapping a list
     try:
@@ -2155,175 +2251,7 @@ def write_changelog(date_str: str, agent_name: str, profile: dict,
         with open(changelog, "w") as f:
             f.write("\n".join(lines))
         log(f"Changelog: {changelog}")
-        # Obsidian vault mirror (config-gated)
-        try:
-            mirror_to_vault(changelog, date_str, agent_name, profile, scan, judge, research)
-        except Exception as e:
-            log(f"[warn] vault mirror failed: {e}")
     return str(changelog)
-
-
-def _paper_slug(finding: dict) -> str:
-    """Stable slug for a paper: arxiv id if detectable, else title hash."""
-    import re as _re, hashlib as _hl
-    link = finding.get("link", "") or ""
-    m = _re.search(r"(\d{4}\.\d{4,5})", link)
-    if m:
-        return f"arxiv-{m.group(1)}"
-    title = (finding.get("title") or "untitled").strip()
-    slug = _re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:60]
-    h = _hl.md5(title.encode()).hexdigest()[:6]
-    return f"{slug}-{h}" if slug else f"paper-{h}"
-
-
-def _yaml_str(s: str) -> str:
-    """Escape a string for safe inclusion as a YAML scalar."""
-    if s is None:
-        return '""'
-    s = str(s).replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ").strip()
-    return f'"{s}"'
-
-
-def _write_paper_note(papers_dir: Path, finding: dict, date_str: str,
-                      agent_name: str, research_detail: dict = None) -> str:
-    """Create or update an atomic paper note. Returns the note's wikilink target."""
-    slug = _paper_slug(finding)
-    note_path = papers_dir / f"{slug}.md"
-    title = finding.get("title", "Untitled")
-    track = finding.get("track", "unknown")
-    source = finding.get("source", "")
-    link = finding.get("link", "")
-    score = finding.get("score", "?")
-    summary = finding.get("summary", "") or ""
-    deep = (research_detail or {}).get("deep_summary", "") or ""
-    applicability = (research_detail or {}).get("applicability", "") or ""
-
-    if note_path.exists():
-        # Update: append this date to seen_dates, refresh score/track if newer.
-        existing = note_path.read_text()
-        # Crude but safe: add a "Seen again" entry at the end.
-        appendum = f"\n\n## Seen again on {date_str} (agent: {agent_name})\n"
-        if score != "?":
-            appendum += f"- Score: {score}\n"
-        if deep and deep not in existing:
-            appendum += f"\n### Deep research notes\n\n{deep}\n"
-        note_path.write_text(existing + appendum)
-    else:
-        frontmatter = (
-            f"---\n"
-            f"type: paper\n"
-            f"title: {_yaml_str(title)}\n"
-            f"track: {_yaml_str(track)}\n"
-            f"source: {_yaml_str(source)}\n"
-            f"link: {_yaml_str(link)}\n"
-            f"first_seen: {date_str}\n"
-            f"first_agent: {agent_name}\n"
-            f"initial_score: {score}\n"
-            f"tags: [paper, {_re_slug_tag(track)}]\n"
-            f"---\n\n"
-        )
-        body = [f"# {title}", ""]
-        if link:
-            body += [f"**Source:** {link}", ""]
-        if summary:
-            body += ["## Summary", "", summary, ""]
-        if deep:
-            body += ["## Deep research notes", "", deep, ""]
-        if applicability:
-            body += [f"**Applicability:** {applicability}", ""]
-        body += [f"---", f"*First surfaced {date_str} by agent `{agent_name}`.*"]
-        note_path.write_text(frontmatter + "\n".join(body))
-    return slug
-
-
-def _re_slug_tag(s: str) -> str:
-    import re as _re
-    return _re.sub(r"[^a-z0-9]+", "-", (s or "unknown").lower()).strip("-") or "unknown"
-
-
-def _rewrite_changelog_with_wikilinks(body: str, findings: list,
-                                      research: list, slug_map: dict) -> str:
-    """Replace finding/research titles in the body with [[slug|Title]] wikilinks."""
-    out = body
-    for f in findings:
-        title = f.get("title")
-        slug = slug_map.get(id(f))
-        if title and slug and title in out:
-            # Swap the first occurrence of the bolded title with a wikilink.
-            out = out.replace(f"**{title}**", f"**[[{slug}|{title}]]**", 1)
-    for r in research:
-        title = r.get("title")
-        slug = slug_map.get(id(r))
-        if title and slug and title in out:
-            out = out.replace(f"### {title}", f"### [[{slug}|{title}]]", 1)
-    return out
-
-
-def mirror_to_vault(changelog: Path, date_str: str, agent_name: str,
-                    profile: dict, scan: dict, judge: dict,
-                    research: dict = None) -> None:
-    """Mirror changelog into Obsidian vault and emit atomic paper notes.
-
-    Config shape (top-level of config.yaml):
-        obsidian_vault:
-          enabled: true
-          path: ~/vault/40-Dream-Cycle
-          per_agent_subfolder: true
-          papers_path: ~/vault/30-Reference/papers
-          emit_paper_notes: true
-    """
-    cfg = load_yaml_config().get("obsidian_vault", {}) or {}
-    if not cfg.get("enabled"):
-        return
-    vault_path = Path(cfg.get("path", "~/vault/40-Dream-Cycle")).expanduser()
-    if cfg.get("per_agent_subfolder", True):
-        vault_path = vault_path / agent_name
-    vault_path.mkdir(parents=True, exist_ok=True)
-
-    body = Path(changelog).read_text()
-
-    # Build paper notes for top_findings and deep research entries.
-    slug_map = {}
-    if cfg.get("emit_paper_notes", True):
-        papers_dir = Path(cfg.get("papers_path", "~/vault/30-Reference/papers")).expanduser()
-        papers_dir.mkdir(parents=True, exist_ok=True)
-
-        findings = scan.get("top_findings", []) or []
-        research_items = (research or {}).get("research", []) or []
-
-        # Index research by title for merging into matching findings.
-        research_by_title = {r.get("title"): r for r in research_items if r.get("title")}
-
-        for f in findings:
-            detail = research_by_title.get(f.get("title"))
-            slug = _write_paper_note(papers_dir, f, date_str, agent_name, detail)
-            slug_map[id(f)] = slug
-
-        # Research-only items that didn't have a matching finding.
-        finding_titles = {f.get("title") for f in findings}
-        for r in research_items:
-            if r.get("title") in finding_titles:
-                continue
-            slug = _write_paper_note(papers_dir, r, date_str, agent_name, r)
-            slug_map[id(r)] = slug
-
-        body = _rewrite_changelog_with_wikilinks(body, findings, research_items, slug_map)
-
-    dest = vault_path / f"{date_str}-changelog.md"
-    priority = scan.get("priority_track", "unknown")
-    score = judge.get("tonight_score", "?")
-    frontmatter = (
-        f"---\n"
-        f"date: {date_str}\n"
-        f"type: dream-cycle\n"
-        f"agent: {agent_name}\n"
-        f"priority_track: {priority}\n"
-        f"score: {score}\n"
-        f"tags: [dream-cycle, {agent_name}]\n"
-        f"---\n\n"
-    )
-    dest.write_text(frontmatter + body)
-    log(f"Vault mirror: {dest} ({len(slug_map)} paper notes)")
 
 # ── Send Summary ──────────────────────────────────────────────────────────────
 
@@ -2588,6 +2516,8 @@ def main():
     log(f"Model: {LOCAL_MODEL} | Repos watched: {len(agent_cfg.get('github_repos', []))} "
         f"| UCB1 C={ucb1_c}{' (disabled)' if args.disable_ucb1 else ''}"
         f" | bridge_p={bridge_prob}")
+    log(f"Routing: frontier={CLAUDE_MODEL} | local_threshold={LOCAL_CONFIDENCE_THRESHOLD} "
+        f"| LOCAL_ONLY={LOCAL_ONLY}")
 
     seen_cache = load_seen_cache(dirs["seen_cache"])
 
