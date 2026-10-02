@@ -48,4 +48,5 @@ dependencies = [
     "anthropic>=0.18.0",
     "requests>=2.28.0",
     "PyYAML>=6.0",
+    "jsonschema>=4.0",
 ]

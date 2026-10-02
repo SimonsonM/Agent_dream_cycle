@@ -13,42 +13,26 @@ import json
 import os
 import shlex
 import shutil
+import hashlib
+import re
 import subprocess
 from datetime import datetime
 from pathlib import Path
 
+import policy
+
 BASE_DIR = Path.home() / "dream-cycle"
 LOGS_DIR = Path.home() / "dream-logs"
 
-# Paths that build_job is permitted to write into.  LLM-generated file_path
-# values are validated against this allowlist before any write occurs.
-ALLOWED_WRITE_DIRS = [
-    BASE_DIR,
-    LOGS_DIR,
-    Path.home() / "dream-logs",
-]
+ALLOWED_WRITE_DIRS = [BASE_DIR, LOGS_DIR]
 
 
 def _safe_target(file_path: str) -> Path | None:
-    """Return a resolved Path only if it falls inside an allowed directory.
-
-    Returns None and logs a warning when the path resolves outside the
-    allowlist — prevents a prompt-injected path (e.g. ~/.ssh/authorized_keys)
-    from being written by the build job.
-    """
-    try:
-        target = Path(file_path).expanduser().resolve()
-    except Exception as e:
-        log(f"    Path resolution failed for '{file_path}': {e}")
-        return None
-    for allowed in ALLOWED_WRITE_DIRS:
-        try:
-            target.relative_to(allowed.resolve())
-            return target
-        except ValueError:
-            continue
-    log(f"    BLOCKED: '{target}' is outside allowed write directories")
-    return None
+    """Resolve file_path iff allowed and not protected (see policy.safe_target)."""
+    t = policy.safe_target(file_path, ALLOWED_WRITE_DIRS)
+    if t is None:
+        log(f"    BLOCKED: '{file_path}' is protected or outside allowed directories")
+    return t
 
 
 def discover_agent_names() -> list[str]:
@@ -70,7 +54,8 @@ def log(msg: str):
 
 
 def _write_applied_record(agent_name: str, event: str, title: str,
-                           action_type: str, file_path: str, rollback_path: str):
+                           action_type: str, file_path: str, rollback_path: str,
+                           sha256: str = ""):
     """Append one line to <agent>/logs/applied_changes.jsonl for reflection feedback."""
     import json
     log_path = BASE_DIR / agent_name / "logs" / "applied_changes.jsonl"
@@ -82,93 +67,89 @@ def _write_applied_record(agent_name: str, event: str, title: str,
         "action_type":  action_type,
         "file_path":    file_path,
         "rollback_path": rollback_path,
+        "sha256":       sha256,
     }
     with open(log_path, "a") as f:
         f.write(json.dumps(record) + "\n")
 
 
+def _write_rollback(path: Path, title: str, record: dict, bak: Path | None,
+                    target: Path | None, applied_log: str) -> None:
+    """Rollback script built from structured data only; no LLM-supplied shell."""
+    one_line = re.sub(r"[^\x20-\x7e]", " ", title)[:80]
+    lines = ["#!/bin/bash", "set -u", f"# Rollback: {one_line}",
+             f"# Applied: {record['timestamp']}", ""]
+    if target is not None and bak is not None:
+        lines.append(f"mv -f -- {shlex.quote(str(bak))} {shlex.quote(str(target))}")
+    elif target is not None:
+        lines.append(f"rm -f -- {shlex.quote(str(target))}")
+    else:
+        lines.append(f"echo {shlex.quote('Manual rollback required for: ' + one_line)}")
+    if applied_log:
+        rec = dict(record, event="reverted")
+        lines.append(f"printf '%s\\n' {shlex.quote(json.dumps(rec))} >> {shlex.quote(applied_log)}")
+    path.write_text("\n".join(lines) + "\n")
+    os.chmod(path, 0o755)
+
+
 def apply_action(action: dict, staged_file: Path, applied_dir: Path,
                  agent_name: str = "") -> bool:
-    action_type  = action.get("action_type", "")
-    content      = action.get("content", "")
-    file_path    = action.get("file_path", "")
-    rollback_cmd = action.get("rollback_command", "")
-    title        = action.get("title", "unknown")
+    action_type = action.get("action_type", "")
+    content     = action.get("content", "") or ""
+    file_path   = action.get("file_path", "")
+    title       = action.get("title", "unknown")
+
+    # Defense in depth: re-derive risk here; never trust the manifest or the LLM.
+    risk, why = policy.effective_risk(action, ALLOWED_WRITE_DIRS)
+    if risk != "low":
+        log(f"    REFUSED ({risk}): {title} — {'; '.join(why)}")
+        return False
 
     log(f"  Applying: {title}")
-
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    target: Path | None = None
+    bak: Path | None = None
     try:
-        if action_type == "model_pull" and content.startswith("ollama pull"):
-            model_name = shlex.split(content)[-1]
-            result = subprocess.run(shlex.split(content),
+        if action_type == "model_pull":
+            model = shlex.split(content)[-1]
+            result = subprocess.run(["ollama", "pull", model],
                                     capture_output=True, text=True, timeout=300)
             if result.returncode != 0:
                 log(f"    Model pull failed: {result.stderr}")
                 return False
-            log(f"    Pulled model: {model_name}")
+            log(f"    Pulled model: {model}")
 
-        elif action_type in ("documentation", "config") and file_path and content:
+        elif action_type in ("documentation", "config"):
             target = _safe_target(file_path)
             if target is None:
                 return False
             target.parent.mkdir(parents=True, exist_ok=True)
             if target.exists():
-                shutil.copy2(target, str(target) + ".bak")
-            with open(target, "w") as f:
+                bak = target.with_name(f"{target.name}.{ts}.bak")
+                shutil.copy2(target, bak)
+            tmp = target.with_name(target.name + ".tmp")
+            with open(tmp, "w") as f:
                 f.write(content)
+            os.replace(tmp, target)
             log(f"    Written: {target}")
-
-        elif action_type == "script" and file_path and content:
-            target = _safe_target(file_path)
-            if target is None:
-                return False
-            target.parent.mkdir(parents=True, exist_ok=True)
-            with open(target, "w") as f:
-                f.write(content)
-            os.chmod(target, 0o755)
-            log(f"    Script written: {target}")
-
         else:
             log(f"    '{action_type}' noted but not auto-executed (safe skip)")
+            return False
 
-        # Write rollback script
-        ts            = datetime.now().strftime("%Y%m%d_%H%M%S")
-        safe_title    = title[:30].replace(" ", "_")
+        safe_title    = re.sub(r"[^A-Za-z0-9_.-]", "_", title)[:30]
         rollback_path = applied_dir / f"rollback_{ts}_{safe_title}.sh"
         applied_log   = str(BASE_DIR / agent_name / "logs" / "applied_changes.jsonl") if agent_name else ""
-        with open(rollback_path, "w") as f:
-            f.write("#!/bin/bash\n")
-            f.write(f"# Rollback: {title}\n")
-            f.write(f"# Applied: {datetime.now().isoformat()}\n\n")
-            if rollback_cmd:
-                f.write(rollback_cmd + "\n")
-            elif file_path:
-                expanded = Path(file_path).expanduser()
-                bak      = Path(str(expanded) + ".bak")
-                if bak.exists():
-                    f.write(f'mv "{bak}" "{expanded}"\n')
-                else:
-                    f.write(f"echo 'Manual rollback required for: {title}'\n")
-            else:
-                f.write(f"echo 'Manual rollback required for: {title}'\n")
-            # Append a revert record to applied_changes.jsonl so Phase 2 sees it
-            if applied_log:
-                f.write(
-                    f'\npython3 -c "'
-                    f"import json, datetime; "
-                    f"open('{applied_log}', 'a').write("
-                    f"json.dumps({{'timestamp': datetime.datetime.now().isoformat(), "
-                    f"'event': 'reverted', 'title': '{title.replace(chr(39), '')}', "
-                    f"'action_type': '{action_type}', 'file_path': '{file_path}', "
-                    f"'rollback_path': '{rollback_path}'}}) + '\\\\n')\"\n"
-                )
-        os.chmod(rollback_path, 0o755)
+        sha = hashlib.sha256(content.encode()).hexdigest()
+        record = {"timestamp": datetime.now().isoformat(), "event": "applied",
+                  "title": title, "action_type": action_type,
+                  "file_path": str(target) if target else file_path,
+                  "rollback_path": str(rollback_path), "sha256": sha}
+        _write_rollback(rollback_path, title, record, bak, target, applied_log)
         log(f"    Rollback: {rollback_path.name}")
 
-        # Record successful apply for Phase 2 feedback loop
         if agent_name:
-            _write_applied_record(agent_name, "applied", title,
-                                  action_type, file_path, str(rollback_path))
+            _write_applied_record(agent_name, "applied", title, action_type,
+                                  record["file_path"], str(rollback_path), sha)
 
         shutil.move(str(staged_file), str(applied_dir / staged_file.name))
         return True
@@ -209,6 +190,7 @@ def run_agent_build(agent_name: str, date_str: str) -> tuple[list, list]:
         with open(staged_file) as f:
             action = json.load(f)
 
+        risk = policy.max_risk(risk, policy.effective_risk(action, ALLOWED_WRITE_DIRS)[0])
         if risk == "low":
             if apply_action(action, staged_file, applied_dir, agent_name=agent_name):
                 applied.append(entry["title"])

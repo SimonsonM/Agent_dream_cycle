@@ -30,6 +30,7 @@ import platform
 
 import anthropic
 import requests
+import policy
 import math
 import uuid
 import xml.etree.ElementTree as ET
@@ -540,8 +541,8 @@ def load_config() -> dict:
                 save_config(migrated)
                 return migrated
             return raw
-        except Exception:
-            pass
+        except Exception as _e:
+            _swallow(_e)
     return {}
 
 def save_config(config: dict):
@@ -781,16 +782,16 @@ def fetch_arxiv_by_categories(
                 log(f"  arXiv cache hit: {tag} ({len(items)} papers)")
                 all_items.extend(items)
                 continue
-            except Exception:
-                pass
+            except Exception as _e:
+                _swallow(_e)
         items = fetch_arxiv(f"cat:{tag}", results_per_tag)
         for item in items:
             item["category_tag"] = tag
         try:
             with open(cache_path, "w") as f:
                 json.dump(items, f)
-        except Exception:
-            pass
+        except Exception as _e:
+            _swallow(_e)
         log(f"  arXiv fetched: {tag} → {len(items)} papers")
         all_items.extend(items)
     return all_items
@@ -862,8 +863,8 @@ def load_perf_log(perf_log_path: Path) -> list[dict]:
         for line in f:
             try:
                 entries.append(json.loads(line))
-            except Exception:
-                pass
+            except Exception as _e:
+                _swallow(_e)
     return entries[-50:]
 
 
@@ -877,14 +878,64 @@ def load_applied_log(dirs: dict) -> list[dict]:
         for line in f:
             try:
                 entries.append(json.loads(line))
-            except Exception:
-                pass
+            except Exception as _e:
+                _swallow(_e)
     return entries[-20:]
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def log(msg: str):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+
+class RunHealth:
+    """Per-run phase status so failures are visible instead of silently empty."""
+    _ORDER = {"ok": 0, "degraded": 1, "failed": 2}
+
+    def __init__(self):
+        self.phases: dict = {}
+        self.current = ""
+        self.llm_failures = 0
+        self.suppressed = 0
+
+    def begin(self, phase: str):
+        self.current = phase
+        self.phases.setdefault(phase, {"status": "ok", "notes": []})
+
+    def note(self, status: str, msg: str, phase: str | None = None):
+        ph = self.phases.setdefault(phase or self.current or "run",
+                                    {"status": "ok", "notes": []})
+        if self._ORDER[status] > self._ORDER[ph["status"]]:
+            ph["status"] = status
+        ph["notes"].append(msg)
+
+    def llm_fail(self, kind: str, err):
+        self.llm_failures += 1
+        self.note("degraded", f"{kind} call failed: {err}")
+
+    def overall(self) -> str:
+        return max((p["status"] for p in self.phases.values()),
+                   key=self._ORDER.get, default="ok")
+
+    def render(self) -> str:
+        lines = [f"Run health: {self.overall().upper()} "
+                 f"(llm_failures={self.llm_failures}, suppressed_errors={self.suppressed})"]
+        for name, ph in self.phases.items():
+            lines.append(f"  {name}: {ph['status']}" + "".join(f"\n    - {n}" for n in ph["notes"][:5]))
+        return "\n".join(lines)
+
+
+HEALTH = RunHealth()
+
+
+def _swallow(exc: Exception):
+    """Replacement for bare `except: pass` — logs and counts instead of hiding."""
+    HEALTH.suppressed += 1
+    log(f"  suppressed {type(exc).__name__}: {str(exc)[:160]}")
+
+
+class LLMError(Exception):
+    """An LLM call produced no usable, schema-valid output."""
+
 
 def extract_json(text: str) -> dict:
     decoder = json.JSONDecoder()
@@ -898,15 +949,21 @@ def extract_json(text: str) -> dict:
     raise ValueError("No JSON object found in response")
 
 def ollama_chat(prompt: str, system: str = "",
-                _retries: int = 3, _retry_delay: float = 10.0) -> str:
+                _retries: int = 3, _retry_delay: float = 10.0,
+                fmt: dict | str | None = None) -> str:
     payload = {"model": LOCAL_MODEL,
                "messages": [{"role": "user", "content": prompt}], "stream": False}
+    if fmt:
+        payload["format"] = fmt   # JSON schema (Ollama >=0.5) or "json"
     if system:
         payload["messages"].insert(0, {"role": "system", "content": system})
     last_err: Exception | None = None
     for attempt in range(_retries):
         try:
             r = requests.post("http://localhost:11434/api/chat", json=payload, timeout=120)
+            if r.status_code == 400 and isinstance(payload.get("format"), dict):
+                payload["format"] = "json"   # older Ollama: no schema support
+                continue
             r.raise_for_status()
             return r.json()["message"]["content"]
         except Exception as e:
@@ -915,6 +972,7 @@ def ollama_chat(prompt: str, system: str = "",
                 log(f"Ollama error (attempt {attempt + 1}/{_retries}): {e} — retrying in {_retry_delay}s")
                 time.sleep(_retry_delay)
     log(f"Ollama failed after {_retries} attempts: {last_err}")
+    HEALTH.llm_fail("ollama", last_err)
     return ""
 
 def claude_chat(prompt: str, system: str = "") -> str:
@@ -926,7 +984,88 @@ def claude_chat(prompt: str, system: str = "") -> str:
         return client.messages.create(**kwargs).content[0].text
     except Exception as e:
         log(f"Claude error: {e}")
+        HEALTH.llm_fail("claude", e)
         return ""
+
+
+def _validate(obj, schema: dict):
+    try:
+        import jsonschema
+    except ImportError:
+        req = schema.get("required", [])
+        if not isinstance(obj, dict) or any(k not in obj for k in req):
+            raise ValueError("missing required keys")
+        return
+    jsonschema.validate(obj, schema)
+
+
+def claude_json(prompt: str, system: str, schema: dict) -> dict:
+    """Forced tool-use so the API returns schema-shaped JSON, not prose."""
+    kwargs = {"model": CLAUDE_MODEL, "max_tokens": 4096,
+              "messages": [{"role": "user", "content": prompt}],
+              "tools": [{"name": "emit", "description": "Return the result.",
+                         "input_schema": schema}],
+              "tool_choice": {"type": "tool", "name": "emit"}}
+    if system:
+        kwargs["system"] = system
+    resp = client.messages.create(**kwargs)
+    for block in resp.content:
+        if getattr(block, "type", "") == "tool_use":
+            return block.input
+    raise LLMError("no tool_use block in response")
+
+
+def llm_json(prompt: str, schema: dict, system: str = "", *, tier: str = "auto") -> dict:
+    """Schema-validated JSON from an LLM. Raises LLMError on failure.
+
+    tier: "local" (never escalate) | "frontier" | "auto" (local first, escalate
+    when local output is empty or fails validation — a verifiable signal, unlike
+    self-reported confidence).
+    """
+    def local() -> dict:
+        p, last = prompt, "unknown"
+        for _ in range(2):
+            raw = ollama_chat(p, system=system, fmt=schema)
+            if not raw:
+                last = "empty response"
+                break
+            try:
+                obj = extract_json(raw)
+                _validate(obj, schema)
+                return obj
+            except Exception as e:
+                last = str(e).splitlines()[0][:200]
+                p = (prompt + f"\n\nYour previous reply was invalid ({last}). "
+                     "Return ONLY valid JSON matching the schema.")
+        raise LLMError(f"local: {last}")
+
+    def frontier() -> dict:
+        try:
+            obj = claude_json(prompt, system, schema)
+            _validate(obj, schema)
+            return obj
+        except LLMError:
+            raise
+        except Exception as e:
+            HEALTH.llm_fail("claude", e)
+            raise LLMError(f"frontier: {str(e).splitlines()[0][:200]}")
+
+    if tier == "local" or (LOCAL_ONLY and tier != "frontier"):
+        return local()
+    if tier == "frontier":
+        try:
+            return frontier()
+        except LLMError as e:
+            if LOCAL_ONLY:
+                raise
+            HEALTH.note("degraded", f"frontier failed, used local: {e}")
+            return local()
+    try:
+        return local()
+    except LLMError as e:
+        log(f"  llm_json: local invalid ({e}); escalating to frontier")
+        HEALTH.note("degraded", f"escalated to frontier: {e}")
+        return frontier()
 
 # ── Reasoning router ──────────────────────────────────────────────────────────
 # PULSE-style routing: local-first, frontier on escalation only.
@@ -1592,6 +1731,43 @@ def audit_dormant_lessons(agent_name: str):
 
 # ── Phase 1: Scan ─────────────────────────────────────────────────────────────
 
+_STR = {"type": "string"}
+_STRS = {"type": "array", "items": _STR}
+SCAN_SCHEMA = {"type": "object", "required": ["priority_track", "top_findings"],
+               "properties": {"priority_track": _STR, "priority_reason": _STR,
+                              "top_findings": {"type": "array", "items": {
+                                  "type": "object", "required": ["title"],
+                                  "properties": {"title": _STR, "source": _STR, "track": _STR,
+                                                 "score": {"type": "number"}, "link": _STR,
+                                                 "summary": _STR}}}}}
+REFLECT_SCHEMA = {"type": "object", "required": ["observations", "improvement_areas"],
+                  "properties": {"observations": _STRS, "improvement_areas": _STRS,
+                                 "suggested_improvement": _STR}}
+RESEARCH_SCHEMA = {"type": "object", "required": ["research", "synthesis"],
+                   "properties": {"synthesis": _STR, "research": {"type": "array", "items": {
+                       "type": "object", "required": ["title"],
+                       "properties": {"title": _STR, "deep_summary": _STR,
+                                      "applicability": {"enum": ["high", "medium", "low"]},
+                                      "applicable_to": _STRS,
+                                      "suggests_change": {"type": "boolean"},
+                                      "change_description": _STR}}}}}
+JUDGE_SCHEMA = {"type": "object", "required": ["staged_actions", "summary", "tonight_score"],
+                "properties": {"summary": _STR,
+                               "tonight_score": {"type": "number", "minimum": 0, "maximum": 10},
+                               "staged_actions": {"type": "array", "items": {
+                                   "type": "object", "required": ["title", "risk", "action_type"],
+                                   "properties": {"title": _STR, "description": _STR,
+                                                  "risk": {"enum": ["low", "medium", "high"]},
+                                                  "action_type": {"enum": ["config", "script", "documentation", "model_pull", "workflow"]},
+                                                  "file_path": _STR, "content": _STR}}}}}
+LESSONS_SCHEMA = {"type": "object", "required": ["lessons"],
+                  "properties": {"lessons": {"type": "array", "items": {
+                      "type": "object", "required": ["lesson", "domain", "confidence"],
+                      "properties": {"lesson": _STR, "domain": _STR,
+                                     "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                                     "source_run_id": _STR, "tags": _STRS}}}}}
+
+
 def phase_scan(profile: dict, agent_cfg: dict, seen_cache: dict,
                dirs: dict | None = None, date_str: str = "",
                yaml_cfg: dict | None = None) -> dict:
@@ -1657,11 +1833,11 @@ Tasks:
   ]
 }}"""
 
-    result = ollama_chat(prompt)
     try:
-        return extract_json(result)
-    except Exception:
-        log("Scan parse failed")
+        return llm_json(prompt, SCAN_SCHEMA, tier="local")
+    except LLMError as e:
+        log(f"Scan failed: {e}")
+        HEALTH.note("failed", f"scan: {e}")
         return {"priority_track": profile["tracks"][0],
                 "priority_reason": "parse error", "top_findings": []}
 
@@ -1702,11 +1878,11 @@ Return JSON only:
   "suggested_improvement": "..."
 }}"""
 
-    result = ollama_chat(prompt)
     try:
-        return extract_json(result)
-    except Exception:
-        return {"observations": ["Reflection parse failed"], "improvement_areas": []}
+        return llm_json(prompt, REFLECT_SCHEMA, tier="local")
+    except LLMError as e:
+        HEALTH.note("degraded", f"reflect: {e}")
+        return {"observations": ["Reflection failed"], "improvement_areas": []}
 
 # ── Phase 3: Deep Research ────────────────────────────────────────────────────
 
@@ -1756,11 +1932,11 @@ Return JSON:
   "synthesis": "..."
 }}"""
 
-    result, _tier = reason(prompt)  # synthesis: local-first, escalate on low confidence
     try:
-        return extract_json(result)
-    except Exception:
-        log("Deep research parse failed")
+        return llm_json(prompt, RESEARCH_SCHEMA, tier="auto")
+    except LLMError as e:
+        log(f"Deep research failed: {e}")
+        HEALTH.note("failed", f"research: {e}")
         return {"research": [], "synthesis": ""}
 
 # ── Phase 4: Judge + Stage ────────────────────────────────────────────────────
@@ -1800,10 +1976,13 @@ Decide what actions to stage:
 - risk: medium → stage for human review (workflow changes, integrations)
 - risk: high  → stage with notes, never auto-apply (live system changes)
 
-Provide a rollback_command for each action.
+Risk is re-derived by a deterministic policy; scripts and anything outside
+docs/config/model pulls are never auto-applied, so do not under-declare risk.
 
 Return JSON:
 {{
+  "summary": "2-3 sentence summary of tonight's run",
+  "tonight_score": 7,
   "staged_actions": [
     {{
       "title": "...",
@@ -1811,18 +1990,17 @@ Return JSON:
       "risk": "low|medium|high",
       "action_type": "config|script|documentation|model_pull|workflow",
       "file_path": "...",
-      "content": "...",
-      "rollback_command": "..."
+      "content": "..."
     }}
   ]
 }}"""
 
-    result, _tier = reason(prompt)  # judge: local-first, escalate on low confidence
     try:
-        return extract_json(result)
-    except Exception:
-        log("Judge parse failed")
-        return {"staged_actions": [], "summary": "Parse failed", "tonight_score": 0}
+        return llm_json(prompt, JUDGE_SCHEMA, tier="auto")
+    except LLMError as e:
+        log(f"Judge failed: {e}")
+        HEALTH.note("failed", f"judge: {e}")
+        return {"staged_actions": [], "summary": "Judge failed", "tonight_score": 0}
 
 # ── Phase 5: Lesson Extraction ────────────────────────────────────────────────
 
@@ -1854,8 +2032,8 @@ Staged actions (title + description):
 Extract 3-7 concise, generalizable lessons from this run. Each lesson should be an
 actionable insight that could improve future runs of this or similar agents.
 
-Return a JSON array only — no prose before or after:
-[
+Return a JSON object:
+{{"lessons": [
   {{
     "lesson": "one-sentence actionable insight",
     "domain": "category such as: tooling, workflow, research, security, llm-routing",
@@ -1863,30 +2041,14 @@ Return a JSON array only — no prose before or after:
     "source_run_id": "{run_id}",
     "tags": ["tag1", "tag2"]
   }}
-]"""
+]}}"""
 
-    result, _tier = reason(prompt, force_local=True)  # lesson extraction: summarization, never escalate
-
-    # Prefer a bare JSON array; fall back to object wrapping a list
     try:
-        start = result.find("[")
-        end   = result.rfind("]")
-        if start != -1 and end != -1:
-            arr = json.loads(result[start:end + 1])
-            if isinstance(arr, list):
-                return arr
-    except Exception:
-        pass
-    try:
-        obj = extract_json(result)
-        for v in obj.values():
-            if isinstance(v, list):
-                return v
-    except Exception:
-        pass
-
-    log("Lesson extraction parse failed — no lessons stored")
-    return []
+        return llm_json(prompt, LESSONS_SCHEMA, tier="local")["lessons"]
+    except LLMError as e:
+        log(f"Lesson extraction failed: {e} — no lessons stored")
+        HEALTH.note("degraded", f"lessons: {e}")
+        return []
 
 
 # ── Experimentation Phase ─────────────────────────────────────────────────────
@@ -2036,8 +2198,8 @@ def _run_ab_test_prompt(change: dict, profile: dict) -> tuple[float, dict]:
         score += avg_pos * 0.35
         metrics.update({"clarity": a.get("clarity"), "feasibility": a.get("feasibility"),
                         "impact": a.get("impact"), "reasoning_a": a.get("reasoning", "")})
-    except Exception:
-        pass
+    except Exception as _e:
+        _swallow(_e)
     try:
         b = extract_json(result_b)
         risk_penalty = (float(b.get("risk_score", 5)) / 10.0) * 0.25
@@ -2046,8 +2208,8 @@ def _run_ab_test_prompt(change: dict, profile: dict) -> tuple[float, dict]:
             score += 0.05
         metrics.update({"risk_score": b.get("risk_score"), "mitigatable": b.get("mitigatable"),
                         "risks": b.get("risks", [])})
-    except Exception:
-        pass
+    except Exception as _e:
+        _swallow(_e)
 
     return max(0.0, min(1.0, score)), metrics
 
@@ -2074,8 +2236,8 @@ def _run_config_validation(change: dict) -> tuple[float, dict]:
             yaml.safe_load(content)
             metrics["parse_result"] = "valid_yaml"
             return 0.85, metrics
-        except Exception:
-            pass
+        except Exception as _e:
+            _swallow(_e)
 
     # Try writing to temp file (checks for encoding/path issues at minimum)
     try:
@@ -2106,8 +2268,8 @@ def _run_mock_integration(change: dict) -> tuple[float, dict]:
             r = requests.head(url, timeout=5, allow_redirects=True)
             if r.status_code < 500:
                 reachable += 1
-        except Exception:
-            pass
+        except Exception as _e:
+            _swallow(_e)
 
     metrics["urls_reachable"] = reachable
     score = 0.4 + (reachable / len(urls[:3])) * 0.5
@@ -2164,7 +2326,10 @@ def write_staging(judge: dict, date_str: str, dirs: dict,
     actions     = judge.get("staged_actions", [])
     manifest    = []
     for i, action in enumerate(actions):
-        risk  = action.get("risk", "high")
+        risk, why = policy.effective_risk(action)
+        if why:
+            log(f"  Policy: '{action.get('title', '')}' -> {risk} ({'; '.join(why)})")
+        action["risk"] = risk
         fname = f"{date_str}_{i:02d}_{action.get('action_type', 'change')}_{risk}.staged"
         fpath = staging_dir / fname
         if dry_run:
@@ -2264,7 +2429,10 @@ def send_gmail_summary(changelog_path: str, judge: dict, scan: dict, agent_name:
         f"Dream Cycle [{agent_name}] {datetime.now().strftime('%Y-%m-%d')} "
         f"— {scan.get('priority_track', '?')} | Score {judge.get('tonight_score', '?')}/10"
     ).replace("\n", " ")
+    if HEALTH.overall() != "ok":
+        subject = f"[{HEALTH.overall().upper()}] " + subject
     body  = judge.get("summary", "No summary generated.")
+    body += "\n\n" + HEALTH.render()
     body += f"\n\nFull changelog: {changelog_path}"
     body += f"\nStaged actions: {len(judge.get('staged_actions', []))}"
 
@@ -2538,18 +2706,33 @@ def main():
     )
 
     # Phase 1: Scan (Qwen) — now includes arXiv category fetch with date cache
+    HEALTH.begin("scan")
     scan = phase_scan(profile, agent_cfg, seen_cache,
                       dirs=dirs, date_str=date_str, yaml_cfg=yaml_cfg)
+    if not scan.get("top_findings"):
+        HEALTH.note("degraded", "scan returned no findings")
     save_seen_cache(dirs["seen_cache"], seen_cache)
 
+    HEALTH.begin("reflect")
     reflect  = phase_reflect(profile, dirs)
+    HEALTH.begin("research")
     research = phase_deep_research(profile, scan, parent_context)
     # Phase 3.5: Experimentation - validate hypotheses before committing changes
+    HEALTH.begin("experimentation")
     experimentation = phase_experimentation(profile, scan, reflect, research, dirs, date_str)
-    judge    = phase_judge_and_stage(profile, scan, reflect, research, experimentation)
+    HEALTH.begin("judge")
+    can_judge = bool(scan.get("top_findings")) or bool(research.get("research"))
+    if can_judge:
+        judge = phase_judge_and_stage(profile, scan, reflect, research, experimentation)
+    else:
+        HEALTH.note("failed", "no scan findings and no research; judge skipped")
+        judge = {"staged_actions": [], "summary": "Judge skipped: no input", "tonight_score": 0}
+    judge_ok = can_judge and HEALTH.phases["judge"]["status"] != "failed"
 
-    # Phase 5: Lesson extraction (Claude/Sonnet)
-    lessons = phase_extract_lessons(judge, run_id, agent_name)
+    # Phase 5: Lesson extraction (Claude/Sonnet) — skip on a failed judge so
+    # junk runs don't pollute the lesson corpus or UCB1 rewards.
+    HEALTH.begin("lessons")
+    lessons = phase_extract_lessons(judge, run_id, agent_name) if judge_ok else []
 
     # Contradiction detection (Sonnet) — before storage (Feature 2)
     if yaml_cfg.get("contradiction_detection", {}).get("enabled", True):
@@ -2566,7 +2749,9 @@ def main():
 
     # Persist final score and summary; cumulative_value accumulates for UCB1
     if not dry_run:
-        update_run_node(run_id, judge.get("tonight_score", 0), judge.get("summary", ""))
+        if judge_ok:
+            update_run_node(run_id, int(round(float(judge.get("tonight_score", 0)))),
+                            judge.get("summary", ""))
 
     # Post-run lesson decay cleanup — not inline with phases (Feature 3)
     if not dry_run:
@@ -2584,6 +2769,17 @@ def main():
                                      experimentation, dry_run=dry_run)
     send_gmail_summary(changelog_path, judge, scan, agent_name, dry_run=dry_run)
 
-    log(f"=== Complete. {len(manifest)} actions staged. ===")
+    log(HEALTH.render())
+    if not dry_run:
+        try:
+            with open(Path(changelog_path).parent / f"{date_str}.health.json", "w") as f:
+                json.dump({"overall": HEALTH.overall(), "phases": HEALTH.phases,
+                           "llm_failures": HEALTH.llm_failures,
+                           "suppressed": HEALTH.suppressed}, f, indent=2)
+        except Exception as _e:
+            _swallow(_e)
+    log(f"=== Complete. {len(manifest)} actions staged. health={HEALTH.overall()} ===")
+    if HEALTH.overall() == "failed":
+        sys.exit(2)
 if __name__ == "__main__":
     main()

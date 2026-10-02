@@ -1,217 +1,97 @@
-#!/usr/bin/env python3
-"""
-Unit tests for build_job.py
-"""
-
+"""build_job: policy-gated apply, structured rollback, injection resistance."""
 import json
-import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch, mock_open, MagicMock
+from unittest.mock import patch
 
-# Add the project root to the path so we can import build_job
-import sys
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from build_job import apply_action, run_agent_build, log
+sys.path.insert(0, str(Path(__file__).parent.parent))
+import build_job
+from build_job import apply_action, run_agent_build
 
 
-class TestBuildJob(unittest.TestCase):
-    
+class BuildJobTests(unittest.TestCase):
     def setUp(self):
-        """Set up test fixtures before each test method."""
-        # Create a temporary directory for testing
-        self.test_dir = tempfile.mkdtemp()
-        self.base_dir_patch = patch('build_job.BASE_DIR', Path(self.test_dir))
-        self.logs_dir_patch = patch('build_job.LOGS_DIR', Path(self.test_dir) / "logs")
-        self.base_dir_patch.start()
-        self.logs_dir_patch.start()
-        
-    def tearDown(self):
-        """Clean up after each test method."""
-        self.base_dir_patch.stop()
-        self.logs_dir_patch.stop()
-        # Clean up temp directory
-        import shutil
-        shutil.rmtree(self.test_dir, ignore_errors=True)
-    
-    @patch('build_job.subprocess.run')
-    @patch('build_job.shutil.copy2')
-    @patch('build_job.open', new_callable=mock_open)
-    @patch('build_job.os.chmod')
-    @patch('build_job.shutil.move')
-    def test_apply_action_model_pull_success(self, mock_move, mock_chmod, mock_file, mock_copy, mock_run):
-        """Test apply_action with successful model pull."""
-        # Mock successful subprocess run
-        mock_result = MagicMock()
-        mock_result.returncode = 0
-        mock_result.stderr = ""
-        mock_run.return_value = mock_result
-        
-        action = {
-            "action_type": "model_pull",
-            "content": "ollama pull test_model:latest",
-            "rollback_command": "",
-            "title": "Test Model Pull"
-        }
-        
-        staged_file = Path(self.test_dir) / "test.staged"
-        applied_dir = Path(self.test_dir) / "applied"
-        applied_dir.mkdir()
-        
-        result = apply_action(action, staged_file, applied_dir)
-        
-        self.assertTrue(result)
-        mock_run.assert_called()
-        mock_chmod.assert_called()
-        mock_move.assert_called()
-        
-    @patch('build_job.subprocess.run')
-    def test_apply_action_model_pull_failure(self, mock_run):
-        """Test apply_action with failed model pull."""
-        # Mock failed subprocess run
-        mock_result = MagicMock()
-        mock_result.returncode = 1
-        mock_result.stderr = "model not found"
-        mock_run.return_value = mock_result
-        
-        action = {
-            "action_type": "model_pull",
-            "content": "ollama pull nonexistent_model:latest",
-            "rollback_command": "",
-            "title": "Failed Model Pull"
-        }
-        
-        staged_file = Path(self.test_dir) / "test.staged"
-        applied_dir = Path(self.test_dir) / "applied"
-        applied_dir.mkdir()
-        
-        result = apply_action(action, staged_file, applied_dir)
-        
-        self.assertFalse(result)
-        
-    @patch('build_job.Path.mkdir')
-    @patch('build_job.shutil.copy2')
-    @patch('build_job.open', new_callable=mock_open)
-    @patch('build_job.os.chmod')
-    @patch('build_job.shutil.move')
-    @patch('build_job.Path.exists')
-    def test_apply_action_documentation(self, mock_exists, mock_move, mock_chmod, mock_file, mock_copy, mock_mkdir):
-        """Test apply_action with documentation action."""
-        action = {
-            "action_type": "documentation",
-            "content": "# Test Documentation\nThis is a test.",
-            "file_path": "~/test/doc.md",
-            "rollback_command": "",
-            "title": "Test Documentation"
-        }
-    
-        staged_file = Path(self.test_dir) / "test.staged"
-        applied_dir = Path(self.test_dir) / "applied"
-        applied_dir.mkdir()
-        
-        # Mock that the target file doesn't exist (so no backup is made)
-        mock_exists.return_value = False
-    
-        result = apply_action(action, staged_file, applied_dir)
-    
-        self.assertTrue(result)
-        mock_mkdir.assert_called()
-        # copy2 is only called if the file exists and needs backup
-        mock_file.assert_called()
-        mock_chmod.assert_called()
-        mock_move.assert_called()
-        
-    @patch('build_job.Path.mkdir')
-    @patch('build_job.open', new_callable=mock_open)
-    @patch('build_job.os.chmod')
-    @patch('build_job.shutil.move')
-    def test_apply_action_script(self, mock_move, mock_chmod, mock_file, mock_mkdir):
-        """Test apply_action with script action."""
-        action = {
-            "action_type": "script",
-            "content": "#!/bin/bash\necho 'Hello World'",
-            "file_path": "~/test/script.sh",
-            "rollback_command": "",
-            "title": "Test Script"
-        }
-        
-        staged_file = Path(self.test_dir) / "test.staged"
-        applied_dir = Path(self.test_dir) / "applied"
-        applied_dir.mkdir()
-        
-        result = apply_action(action, staged_file, applied_dir)
-        
-        self.assertTrue(result)
-        mock_mkdir.assert_called()
-        mock_file.assert_called()
-        mock_chmod.assert_called()
-        mock_move.assert_called()
-        
-    @patch('build_job.Path.exists')
-    @patch('builtins.open', new_callable=mock_open)
-    @patch('build_job.Path.glob')
-    @patch('build_job.apply_action')
-    def test_run_agent_build_low_risk(self, mock_apply, mock_glob, mock_file, mock_exists):
-        """Test run_agent_build with low risk actions."""
-        # Mock file existence
-        mock_exists.return_value = True
-        
-        # Mock manifest file
-        manifest_data = [
-            {
-                "risk": "low",
-                "title": "Low Risk Action",
-                "file": str(Path(self.test_dir) / "low_risk.stged")
-            }
-        ]
-        mock_file.return_value.read.return_value = json.dumps(manifest_data)
-        
-        # Mock glob to return manifest
-        mock_manifest = MagicMock()
-        mock_manifest.__str__ = lambda self: str(Path(self.test_dir) / "2026-01-01_manifest.json")
-        mock_glob.return_value = [mock_manifest]
-        
-        # Mock apply_action to return True
-        mock_apply.return_value = True
-        
-        applied, review_needed = run_agent_build("test_agent", "2026-01-01")
-        
-        self.assertEqual(len(applied), 1)
-        self.assertEqual(len(review_needed), 0)
-        self.assertEqual(applied[0], "Low Risk Action")
-        
-    @patch('build_job.Path.exists')
-    @patch('builtins.open', new_callable=mock_open)
-    @patch('build_job.Path.glob')
-    @patch('build_job.apply_action')
-    def test_run_agent_build_high_risk(self, mock_apply, mock_glob, mock_file, mock_exists):
-        """Test run_agent_build with high risk actions."""
-        # Mock file existence
-        mock_exists.return_value = True
-        
-        # Mock manifest file
-        manifest_data = [
-            {
-                "risk": "high",
-                "title": "High Risk Action",
-                "file": str(Path(self.test_dir) / "high_risk.stged")
-            }
-        ]
-        mock_file.return_value.read.return_value = json.dumps(manifest_data)
-        
-        # Mock glob to return manifest
-        mock_manifest = MagicMock()
-        mock_manifest.__str__ = lambda self: str(Path(self.test_dir) / "2026-01-01_manifest.json")
-        mock_glob.return_value = [mock_manifest]
-        
-        applied, review_needed = run_agent_build("test_agent", "2026-01-01")
-        
-        self.assertEqual(len(applied), 0)
-        self.assertEqual(len(review_needed), 1)
-        self.assertEqual(review_needed[0]["title"], "High Risk Action")
-        self.assertEqual(review_needed[0]["risk"], "high")
+        self.tmp = Path(tempfile.mkdtemp()).resolve()
+        self.base = self.tmp / "dream-cycle"
+        self.logs = self.tmp / "dream-logs"
+        self.base.mkdir()
+        self.applied = self.base / "a" / "staging" / "applied"
+        self.applied.mkdir(parents=True)
+        self.staged = self.base / "a" / "staging" / "x.staged"
+        self.staged.write_text("{}")
+        for target, val in (("BASE_DIR", self.base), ("LOGS_DIR", self.logs),
+                            ("ALLOWED_WRITE_DIRS", [self.base, self.logs])):
+            p = patch.object(build_job, target, val)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _doc(self, **kw):
+        a = {"title": "Doc", "risk": "low", "action_type": "documentation",
+             "file_path": str(self.base / "a" / "notes.md"), "content": "# hi\n"}
+        a.update(kw)
+        return a
+
+    def test_doc_applied_and_rollback_restores(self):
+        target = self.base / "a" / "notes.md"
+        target.write_text("orig")
+        self.assertTrue(apply_action(self._doc(), self.staged, self.applied, "a"))
+        self.assertEqual(target.read_text(), "# hi\n")
+        rb = next(self.applied.glob("rollback_*.sh"))
+        subprocess.run(["bash", str(rb)], check=True)
+        self.assertEqual(target.read_text(), "orig")
+        rec = json.loads((self.base / "a" / "logs" / "applied_changes.jsonl")
+                         .read_text().splitlines()[-1])
+        self.assertEqual(rec["event"], "reverted")
+
+    def test_new_file_rollback_removes_it(self):
+        self.assertTrue(apply_action(self._doc(), self.staged, self.applied, "a"))
+        subprocess.run(["bash", str(next(self.applied.glob("rollback_*.sh")))], check=True)
+        self.assertFalse((self.base / "a" / "notes.md").exists())
+
+    def test_script_never_applied_even_if_declared_low(self):
+        a = self._doc(action_type="script", file_path=str(self.base / "a" / "x.sh"),
+                      content="#!/bin/sh\necho hi\n")
+        self.assertFalse(apply_action(a, self.staged, self.applied, "a"))
+        self.assertFalse((self.base / "a" / "x.sh").exists())
+
+    def test_path_escape_and_protected_blocked(self):
+        for fp in (str(self.tmp / "evil.md"), str(self.base / ".." / "evil.md"),
+                   str(self.base / "a" / "staging" / "m.md"),
+                   str(self.base / "a" / "config.json")):
+            self.assertFalse(apply_action(self._doc(file_path=fp), self.staged,
+                                          self.applied, "a"), fp)
+
+    def test_rollback_ignores_llm_shell_and_quotes_title(self):
+        marker = self.tmp / "pwned"
+        a = self._doc(title=f"x'; touch {marker}; '", rollback_command=f"touch {marker}")
+        self.assertTrue(apply_action(a, self.staged, self.applied, "a"))
+        subprocess.run(["bash", str(next(self.applied.glob("rollback_*.sh")))], check=True)
+        self.assertFalse(marker.exists())
+
+    def test_model_pull_strict(self):
+        with patch.object(build_job.subprocess, "run") as run:
+            run.return_value.returncode = 0
+            ok = {"title": "m", "risk": "low", "action_type": "model_pull",
+                  "content": "ollama pull qwen3.5:9b"}
+            self.assertTrue(apply_action(ok, self.staged, self.applied, "a"))
+            run.assert_called_once_with(["ollama", "pull", "qwen3.5:9b"],
+                                        capture_output=True, text=True, timeout=300)
+            bad = dict(ok, content="ollama pull x; rm -rf ~")
+            self.assertFalse(apply_action(bad, self.staged, self.applied, "a"))
+            self.assertEqual(run.call_count, 1)
+
+    def test_manifest_low_but_policy_high_goes_to_review(self):
+        sd = self.base / "a" / "staging"
+        f = sd / "s.staged"
+        f.write_text(json.dumps(self._doc(action_type="script", file_path=str(self.base / "x.sh"))))
+        (sd / "2026-01-01_manifest.json").write_text(
+            json.dumps([{"file": str(f), "risk": "low", "title": "Doc"}]))
+        applied, review = run_agent_build("a", "2026-01-01")
+        self.assertEqual(applied, [])
+        self.assertEqual(review[0]["risk"], "high")
 
 
 if __name__ == "__main__":
