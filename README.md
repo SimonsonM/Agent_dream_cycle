@@ -38,25 +38,30 @@ Reviews today's agent performance log. Identifies patterns in task failures, mod
 Takes the top 5 findings and goes deep using Claude Sonnet. Reads iteratively — a finding that builds on another finding gets followed further. Cross-references against your current stack and active projects.
 
 **Phase 3.5 — Experimentation**
-Validates proposed changes through safe experimentation (e.g., A/B testing for prompts, sandboxed configuration validation, mock integrations) before committing to staging. Only changes that pass a validation threshold proceed to the Judge phase.
+Validates proposed prompt changes by replay, not by asking a model whether its own idea is good. A candidate instruction is run against the last several nights of real scan inputs (saved to `<AGENT>/replay/`), baseline vs candidate, and a Claude judge compares the outputs pairwise with randomized A/B order. A change passes only with at least 3 saved nights of input, a 60%+ win rate, and no drop in valid-JSON rate. Config, tool and workflow changes have no automated test: they score a neutral 0.5 and always go to human review. Until 3 nights of inputs exist, every experiment returns `insufficient_data`.
 
 **Phase 4 — Judge and Stage**
-Decides what is worth acting on. Stages changes to `~/dream-cycle/dream-staging/` by risk level. Writes a rollback script for every staged action. Nothing touches live config directly.
+Decides what is worth acting on and returns a run summary and a 0-10 `tonight_score` (the UCB1 reward). Every staged action's risk is re-derived by a deterministic policy (`policy.py`); the model's own risk label can only be raised, never lowered. Stages changes to `~/dream-cycle/<AGENT>/staging/`. Nothing touches live config directly.
+
+**Phase 5 — Lessons**
+Distills the run into structured lessons for the corpus. Skipped when the Judge failed, so bad runs do not pollute lessons or UCB1.
 
 **4 AM Build Job**
-Auto-applies LOW risk changes only. Flags MEDIUM and HIGH for morning review. Writes a build report.
+Auto-applies LOW risk changes only, after re-checking policy at apply time. Flags MEDIUM and HIGH for morning review. Writes a build report.
 
 ## Risk Levels
 
-Every staged change is scored before anything runs.
+Risk is decided by `policy.py`, not by the LLM. Effective risk = the higher of the model's declared risk and the policy result. The policy runs when changes are staged and again in the build job.
 
-| Level  | Behavior                        | Examples                                      |
-|--------|---------------------------------|-----------------------------------------------|
-| LOW    | Auto-applied at 4 AM            | Doc updates, model pulls, config tweaks       |
-| MEDIUM | Staged for human review         | Workflow changes, new tool integrations       |
-| HIGH   | Noted, never auto-applied       | Anything touching live systems                |
+| Level  | Behavior                  | What qualifies                                                                 |
+|--------|---------------------------|--------------------------------------------------------------------------------|
+| LOW    | Auto-applied at 4 AM      | Docs (`.md/.txt/.rst`), parseable config (`.json/.yaml`) inside allowed dirs, plain `ollama pull <name>` |
+| MEDIUM | Staged for human review   | Workflow changes, unparseable config, files with other suffixes                |
+| HIGH   | Noted, never auto-applied | Scripts (always), unknown action types, protected or out-of-bounds paths, oversized content |
 
-Every auto-applied change writes a `rollback_TIMESTAMP.sh` to `~/dream-cycle/dream-staging/applied/`. One command undoes any night's work.
+Protected paths (never auto-writable): `config.json`, `config.yaml`, `.mcp.json`, `.env`, anything under `staging/`, `chroma_db/`, `.git/`, `.ssh/`, `systemd/`.
+
+Every auto-applied change writes a `rollback_TIMESTAMP_*.sh` to `~/dream-cycle/<AGENT>/staging/applied/`. Rollbacks are generated from structured data only and fully quoted; LLM-supplied shell is never executed. A rollback restores the timestamped `.bak` copy (or removes a newly created file) and logs a `reverted` record. Applied changes also record a SHA-256 of their content in `applied_changes.jsonl`.
 
 ---
 
@@ -65,7 +70,13 @@ Every auto-applied change writes a `rollback_TIMESTAMP.sh` to `~/dream-cycle/dre
 Dream Cycle uses a hybrid routing strategy to keep costs near zero.
 
 - **Scan and Reflect** use a local Ollama model (Qwen 3.5 9B or 27B). No API cost, no rate limits, no data leaving your machine.
-- **Deep Research and Judge** use Claude Sonnet. These phases require genuine multi-step reasoning. Pay for it only here.
+- **Deep Research and Judge** start local and escalate to Claude Sonnet only when needed. These phases require genuine multi-step reasoning.
+
+**Structured output.** Phases that return JSON (scan, reflect, research, judge, lessons) go through `llm_json()`: Claude calls use forced tool-use, Ollama calls pass the JSON schema as `format`, and every result is validated with `jsonschema`. Invalid local output gets one repair retry, then escalates to Claude. Escalation is driven by validity, not by the model's self-reported confidence.
+
+## Run Health
+
+Failures are visible instead of silently producing empty output. Each phase is tracked as `ok`, `degraded` or `failed`. LLM failures and previously swallowed exceptions are counted. The Judge is skipped when there are no findings and no research. The email subject gets a `[DEGRADED]` or `[FAILED]` prefix with phase notes in the body, a `YYYY-MM-DD.health.json` is written next to the changelog, and the process exits with code 2 on failure so cron or systemd can alert on it.
 
 Recommended Ollama models by hardware:
 
@@ -95,6 +106,7 @@ Edit `TRACKS` in `dream_cycle.py` to match your work.
 ~/dream-logs/YYYY-MM-DD-changelog.md      Full research report, staged action summary
 ~/dream-logs/YYYY-MM-DD-build-report.md   What was applied, what needs your review
 ~/dream-logs/YYYY-MM-DD.mail             Gmail summary (if msmtp not configured)
+<AGENT>/logs/YYYY-MM-DD.health.json       Per-phase status, LLM failure counts
 ```
 
 ---
@@ -176,10 +188,12 @@ The backend is the `agent_memories` ChromaDB collection at `~/dream-cycle/chroma
 - Ubuntu / macOS / Windows with cron or Task Scheduler available
 
 ```bash
-pip install anthropic requests          # required
+pip install anthropic requests          # required (plus jsonschema below)
 pip install chromadb                    # optional — enables memory persistence
 pip install mcp                         # optional — enables Lumen MCP server
+pip install jsonschema                  # required — validates LLM JSON output
 pip install pyyaml                      # optional — enables config.yaml features
+pip install pytest                      # optional — run the tests
 ```
 
 ---
@@ -232,6 +246,8 @@ Even a few logged events per day gives the reflection phase something real to wo
 dream-cycle/                    (repo)
   dream_cycle.py                Main orchestrator — runs at 11:15 PM
   build_job.py                  4 AM build — applies low-risk staged changes
+  policy.py                     Deterministic risk policy and path protection
+  replay_eval.py                Replay A/B evaluation for prompt changes
   perf_log.py                   Performance logger — call from your agents
   set_up.sh                     One-time install and cron registration
   config.yaml                   Extended feature config (arXiv, decay, bridge...)
@@ -239,6 +255,8 @@ dream-cycle/                    (repo)
   .mcp.json                     Registers Lumen with Claude Code
   agents/
     example_agent.json          Manifest schema reference (active: false)
+  tests/                        pytest suite (policy, build job, llm_json, replay)
+  ROADMAP.md                    Planned changes
 
 ~/dream-cycle/                  (runtime, created by set_up.sh)
   config.json                   Model selection and per-agent repo lists
@@ -251,6 +269,9 @@ dream-cycle/                    (repo)
         rollback_*.sh           Rollback scripts for every applied change
     logs/
       YYYY-MM-DD-changelog.md   Morning research report
+      YYYY-MM-DD.health.json    Run health
+    replay/
+      *_scan_inputs.json        Saved scan inputs for replay evals (last 14)
     performance.jsonl           Agent event log — feeds Phase 2
     seen_cache.json             Dedup cache (7-day TTL)
 
@@ -267,12 +288,29 @@ dream-cycle/                    (repo)
 ## Rollback
 
 ```bash
-# List rollback scripts
-ls ~/dream-cycle/dream-staging/applied/rollback_*.sh
+# List rollback scripts for an agent
+ls ~/dream-cycle/<AGENT>/staging/applied/rollback_*.sh
 
-# Undo a specific night
-bash ~/dream-cycle/dream-staging/applied/rollback_20260330_040012_update_model_config.sh
+# Undo a specific change
+bash ~/dream-cycle/<AGENT>/staging/applied/rollback_20260330_040012_update_model_config.sh
 ```
+
+---
+
+## Testing
+
+```bash
+pip install pytest jsonschema pyyaml anthropic requests python-dotenv chromadb
+python3 -m pytest tests -q
+```
+
+Known issue: `tests/test_dream_cycle.py` and `tests/test_experimentation.py` fail at import (they reference functions that no longer exist) and several manifest tests fail on a schema mismatch. These predate the hardening work and are tracked in [ROADMAP.md](ROADMAP.md).
+
+---
+
+## Roadmap
+
+See [ROADMAP.md](ROADMAP.md).
 
 ---
 
